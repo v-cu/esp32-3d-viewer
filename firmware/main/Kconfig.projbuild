@@ -1,0 +1,74 @@
+menu "3D viewer configuration"
+
+    comment "Board: Waveshare ESP32-S3-Touch-AMOLED-1.8 V2 (368x448, CO5300, CST820)"
+
+    choice CAR3D_ROTATION_CHOICE
+        prompt "Default screen orientation"
+        default CAR3D_ROTATION_270
+        help
+            Orientation used until one is chosen in Settings (Screen: Landscape /
+            Portrait, stored in NVS). 0 = native portrait (368x448), 90/270 = landscape
+            (448x368, the car is drawn larger), 180 = upside down.
+        config CAR3D_ROTATION_0
+            bool "0 deg (portrait, native)"
+        config CAR3D_ROTATION_90
+            bool "90 deg (landscape)"
+        config CAR3D_ROTATION_180
+            bool "180 deg (portrait, upside down)"
+        config CAR3D_ROTATION_270
+            bool "270 deg (landscape)"
+    endchoice
+
+    config CAR3D_ROTATION
+        int
+        default 1 if CAR3D_ROTATION_90
+        default 2 if CAR3D_ROTATION_180
+        default 3 if CAR3D_ROTATION_270
+        default 0
+
+    config CAR3D_QSPI_MHZ
+        int "Display QSPI clock [MHz]"
+        range 10 80
+        default 40
+        help
+            40 MHz is what Waveshare uses. The panel pins are routed through the GPIO
+            matrix, 80 MHz may or may not work on your unit.
+
+    config CAR3D_BAND_HEIGHT
+        int "Renderer band height (rows, even)"
+        range 8 64
+        default 32
+
+    config CAR3D_MAX_FPS
+        int "Frame rate cap"
+        range 10 120
+        default 60
+
+    config CAR3D_IMU_AXES
+        string "IMU -> screen axis mapping"
+        default "+x+y+z"
+        help
+            Three signed axes telling which IMU axis points to the panel's native
+            right (+x), up (+y) and out of the screen (+z), e.g. "-y+x+z".
+            If tilting the board turns the car the wrong way, change this string.
+
+    config CAR3D_DISPLAY_SELFTEST
+        bool "Show colour bars for 1.5 s at boot (display self-test)"
+        default n
+
+    config CAR3D_TOUCH_CURSOR
+        bool "Settings screen: show a red dot where the touch is detected (debug)"
+        default n
+
+    config CAR3D_MOTION_INVERT
+        bool "Motion: invert the left/right tilt direction"
+        default n
+        help
+            In Motion mode tilting the board left/right (like a steering wheel) turns
+            the model. Enable this if it turns the opposite way to what you expect.
+
+    config CAR3D_SHOW_FPS_DEFAULT
+        bool "Show FPS counter by default"
+        default y
+
+endmenu

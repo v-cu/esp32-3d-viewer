@@ -1,0 +1,26 @@
+# ESP-IDF build output and generated config
+build/
+firmware/build/
+firmware/managed_components/
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# converter reports and source models (often large, check their licence before sharing)
+*.bin.json
+*.glb
+*.gltf
+*.fbx
+*.blend
+
+# PC simulator
+sim/build/
+out/
+
+# editors / tools
+.vscode/
+.clangd
+.idea/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db

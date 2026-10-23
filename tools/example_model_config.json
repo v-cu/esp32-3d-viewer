@@ -1,0 +1,13 @@
+{
+  "name": "Audi A4",
+  "budget": 10000,
+  "paint": "#B3141E",
+  "up_axis": "y",
+  "materials": {
+    "Car_Paint": "paint",
+    "Windows": "glass",
+    "Tyre_Rubber": "tire",
+    "Engine_Block": "drop",
+    "Seats": "interior"
+  }
+}
