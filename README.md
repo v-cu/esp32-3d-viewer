@@ -235,6 +235,12 @@ docs/                    photo and demo GIF used by this README
 | log says `I2C bus stuck low` | power the board off completely (USB **and** battery, or hold PWR ~10 s) |
 | a model is too slow | convert it with `--budget 7000`, or turn off *Smooth edges* |
 
+## 3D-printed desk stand
+
+A desk stand for the module (vertical and horizontal version) is available on MakerWorld:
+
+👉 [Desk Stand for ESP32-S3 AMOLED 1.8 – 3D Model Viewer](https://makerworld.com/models/3483955-desk-stand-for-esp32-s3-amoled-1-8-3d-model-viewer#profileId-3978230)
+
 ## Credits
 
 Demo models, converted to the R3DM format (the original licences apply):
