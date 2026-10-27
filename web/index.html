@@ -159,6 +159,11 @@
               <label>Body colour (cars)
                 <span class="paint"><input type="checkbox" id="s-paint-on" aria-label="Override the body colour"><input type="color" id="s-paint" value="#b3141e"></span>
               </label>
+              <div class="wide mat-ov">
+                <span>Materials (fix what was detected wrong)</span>
+                <ul id="s-mats"></ul>
+                <button class="link" id="s-mats-reset" type="button" hidden>Undo all material changes</button>
+              </div>
               <label class="check wide"><input type="checkbox" id="s-hidden"><span>Keep hidden geometry (for example a convertible without glass)</span></label>
             </div>
             <button class="btn" id="d-reconvert">Convert again</button>

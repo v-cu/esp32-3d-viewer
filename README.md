@@ -148,7 +148,13 @@ What the converter does automatically:
 - texture atlases (windows, lights and trim in one texture) are split into colour regions
   and classified by colour **and** position: red at the rear = tail lights, white at the
   front = headlights, orange = indicators, dark above the window line = glass
-- transparent lenses over the lamps are removed (the renderer has no transparency)
+- transparent lenses over the lamps are removed (the renderer has no transparency), and so
+  are transparent layers lying on another surface (a clear coat over the paint) and ground /
+  shadow planes under the model
+- lamps without telling material names are found by position and colour (white / amber at
+  the front, red at the rear)
+- textured objects keep the brightness detail of the texture (stored per vertex), the colour
+  regions follow the hue
 - finds the front of the car from the lamp colours
 - decimates to the budget, giving the body most of the triangles
 - transfers smooth normals from the original mesh, bakes ambient occlusion, renders a

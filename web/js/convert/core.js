@@ -18,6 +18,24 @@ const CLS_IMPORTANCE = {
   [CLS.PLASTIC]: 0.55, [CLS.LIGHT_RED]: 1.1, [CLS.LIGHT_CLEAR]: 1.2, [CLS.INTERIOR]: 0.3,
   [CLS.CARBON]: 0.8, [CLS.GENERIC]: 0.9,
 };
+const TEX_DETAIL_CLS = [CLS.GENERIC, CLS.PLASTIC, CLS.INTERIOR, CLS.PAINT];
+
+// linear per-vertex colour from per-face sRGB colours (area weighted)
+function vertexColors(p) {
+  const nv = p.V.length / 3, nf = p.F.length / 3, acc = new Float64Array(nv * 4);
+  const area = faceAreas(p.V, p.F);
+  for (let f = 0; f < nf; f++) {
+    const w = area[f] + 1e-12;
+    const c = [srgbToLin1(p.faceCol[3 * f]), srgbToLin1(p.faceCol[3 * f + 1]), srgbToLin1(p.faceCol[3 * f + 2])];
+    for (let k = 0; k < 3; k++) {
+      const v = p.F[3 * f + k];
+      acc[4 * v] += c[0] * w; acc[4 * v + 1] += c[1] * w; acc[4 * v + 2] += c[2] * w; acc[4 * v + 3] += w;
+    }
+  }
+  const out = new Float32Array(nv * 3);
+  for (let v = 0; v < nv; v++) for (let c = 0; c < 3; c++) out[3 * v + c] = acc[4 * v + c] / Math.max(acc[4 * v + 3], 1e-12);
+  return out;
+}
 const CLS_MATCAP = { [CLS.PAINT]: 128, [CLS.GLASS]: 128, [CLS.CHROME]: 128 };
 
 // --------------------------------------------------------------------------------------
@@ -40,7 +58,7 @@ const RULES = [
   [CLS.TIRE, /tire|tyre|rubber|reifen|opon|guma|llanta/],
   [CLS.CARBON, /carbon/],
   [CLS.METAL, /rim|wheel|alloy|felge|disc|disk|brake|caliper|metal|steel|alu|exhaust|felg/],
-  [CLS.PAINT, /paint|body|carpaint|car_paint|lack|karoser|exterior|coat/],
+  [CLS.PAINT, /paint|body|carpaint|car_paint|(?<![a-z])lack|karoser|exterior|coat/],
   [CLS.PLASTIC, /plastic|trim|black|grill|grille|bumper_low|matte|kunststoff/],
 ];
 
@@ -106,14 +124,14 @@ function kmeans(X, n, dim, k, rand) {
 }
 
 // cluster the per-face texture colours into regions -> {lbl, colors(sRGB)} or null
-function splitByTexture(p, maxColors) {
+function splitByTexture(p, maxColors, lWeight = 1.0) {
   if (!p.faceCol) return null;
   const F = p.F, V = p.V, nf = F.length / 3;
   const area = faceAreas(V, F);
   const lab = new Float64Array(nf * 3);
   for (let f = 0; f < nf; f++) {
     srgbToOklab(p.faceCol[3 * f], p.faceCol[3 * f + 1], p.faceCol[3 * f + 2], lab, 3 * f);
-    lab[3 * f + 1] *= 1.6; lab[3 * f + 2] *= 1.6;
+    lab[3 * f] *= lWeight; lab[3 * f + 1] *= 1.6; lab[3 * f + 2] *= 1.6;
   }
   const rand = rng(1);
   const nFit = Math.min(nf, 40000);
@@ -273,8 +291,32 @@ function isAtlas(p) {
   return std > 0.12 || sat / nf > 0.02;
 }
 
+// textured parts of one material are clustered together (consistent regions across pieces)
+function mergeByMaterial(parts) {
+  const groups = new Map(), out = [];
+  for (const p of parts) {
+    if (!p.faceCol) { out.push(p); continue; }
+    const k = p.mat.name + '|' + p.cls;
+    if (!groups.has(k)) { groups.set(k, []); out.push(k); }
+    groups.get(k).push(p);
+  }
+  return out.map((e) => {
+    if (typeof e !== 'string') return e;
+    const list = groups.get(e);
+    if (list.length === 1) return list[0];
+    const j = joinParts(list);
+    let n = 0;
+    for (const p of list) n += p.faceCol.length;
+    const fc = new Float32Array(n);
+    let o = 0;
+    for (const p of list) { fc.set(p.faceCol, o); o += p.faceCol.length; }
+    return { ...list[0], V: j.V, F: j.F, faceCol: fc, texDetail: true };
+  });
+}
+
 function applyTextureSplit(parts, isCar, maxColors, log) {
   if (maxColors <= 1) return parts;
+  if (!isCar) parts = mergeByMaterial(parts);
   let carH = 1;
   if (isCar) {
     carH = -Infinity;
@@ -292,7 +334,8 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
     if (mode) {
       try {
         const k = mode === 'object' ? maxColors : mode === 'light' ? Math.min(maxColors, 6) : Math.min(maxColors, 10);
-        res = splitByTexture(p, k);
+        // objects: brightness detail is kept per vertex, so regions follow hue more than shading
+        res = splitByTexture(p, k, mode === 'object' ? 0.5 : 1.0);
       } catch (e) {
         log(`  texture split skipped for '${p.name}': ${e.message}`);
       }
@@ -335,7 +378,7 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
         let q = 0;
         for (let f = 0; f < nf; f++) if (m[f]) { fc[q++] = p.faceCol[3 * f]; fc[q++] = p.faceCol[3 * f + 1]; fc[q++] = p.faceCol[3 * f + 2]; }
         const mi = { ...p.mat, color: srgbToLin(col), name: `${p.mat.name}_c${r}${pieces.length > 1 ? 'abcd'[j] : ''}` };
-        out.push({ name: `${p.name}_c${r}_${j}`, mat: mi, cls, V: sm.V, F: sm.F, faceCol: fc, fromSplit: true });
+        out.push({ name: `${p.name}_c${r}_${j}`, mat: mi, cls, V: sm.V, F: sm.F, faceCol: fc, fromSplit: true, texDetail: true });
         summary.push(`${CLS_NAMES[cls]}:${cntm}`);
       });
     });
@@ -348,17 +391,23 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
 // lamp lenses
 // --------------------------------------------------------------------------------------
 function dropLampCovers(parts, log, dist = 0.05) {
+  // (a) glass lying on top of light geometry; (b) glass at the front / rear end of the car
+  // below the window line: head / tail / fog lamp lenses (windows sit higher or further in)
   const lights = parts.filter((p) => (p.cls === CLS.LIGHT_RED || p.cls === CLS.LIGHT_CLEAR) && p.F.length);
-  if (!lights.length) return parts;
-  const pts = [];
-  for (const p of lights) {
-    pts.push(p.V);
-    const nf = p.F.length / 3, c = new Float64Array(nf * 3);
-    for (let f = 0; f < nf; f++)
-      for (let k = 0; k < 3; k++) c[3 * f + k] = (p.V[3 * p.F[3 * f] + k] + p.V[3 * p.F[3 * f + 1] + k] + p.V[3 * p.F[3 * f + 2] + k]) / 3;
-    pts.push(c);
+  let carH = 0;
+  for (const p of parts) for (let i = 1; i < p.V.length; i += 3) carH = Math.max(carH, p.V[i]);
+  let grid = null;
+  if (lights.length) {
+    const pts = [];
+    for (const p of lights) {
+      pts.push(p.V);
+      const nf = p.F.length / 3, c = new Float64Array(nf * 3);
+      for (let f = 0; f < nf; f++)
+        for (let k = 0; k < 3; k++) c[3 * f + k] = (p.V[3 * p.F[3 * f] + k] + p.V[3 * p.F[3 * f + 1] + k] + p.V[3 * p.F[3 * f + 2] + k]) / 3;
+      pts.push(c);
+    }
+    grid = new PointGrid(concatF64(pts), dist);
   }
-  const grid = new PointGrid(concatF64(pts), dist);
   const out = [];
   let dropped = 0;
   for (const p of parts) {
@@ -369,9 +418,11 @@ function dropLampCovers(parts, log, dist = 0.05) {
       const x = (p.V[3 * p.F[3 * f]] + p.V[3 * p.F[3 * f + 1]] + p.V[3 * p.F[3 * f + 2]]) / 3;
       const y = (p.V[3 * p.F[3 * f] + 1] + p.V[3 * p.F[3 * f + 1] + 1] + p.V[3 * p.F[3 * f + 2] + 1]) / 3;
       const z = (p.V[3 * p.F[3 * f] + 2] + p.V[3 * p.F[3 * f + 1] + 2] + p.V[3 * p.F[3 * f + 2] + 2]) / 3;
-      grid.nearest(x, y, z, dist);
-      keep[f] = grid.lastDist > dist ? 1 : 0;
-      nk += keep[f];
+      let k = 1;
+      if (Math.abs(x) > 0.5 && y < 0.6 * carH) k = 0;
+      else if (grid) { grid.nearest(x, y, z, dist); if (!(grid.lastDist > dist)) k = 0; }
+      keep[f] = k;
+      nk += k;
     }
     dropped += nf - nk;
     if (nk === nf) { out.push(p); continue; }
@@ -382,6 +433,99 @@ function dropLampCovers(parts, log, dist = 0.05) {
   }
   if (dropped) log(`  removed ${dropped} lamp-lens glass triangles (lamps visible)`);
   return out;
+}
+
+// cars whose lamps have no telling names (Material__123): small parts at the very front /
+// rear below the roof, bright neutral (or amber) at the front = headlights, red at the
+// rear = tail lights. Only used for an end of the car where no lamp was found yet.
+function lampsByPosition(parts, log) {
+  let carH = 0;
+  for (const p of parts) for (let i = 1; i < p.V.length; i += 3) carH = Math.max(carH, p.V[i]);
+  const hasLight = (front) => parts.some((p) => {
+    if ((p.cls !== CLS.LIGHT_CLEAR && p.cls !== CLS.LIGHT_RED) || p.fromSplit) return false;   // named lamps only
+    let sx = 0;
+    for (let i = 0; i < p.V.length; i += 3) sx += p.V[i];
+    return front ? sx > 0 : sx < 0;
+  });
+  const doFront = !hasLight(true), doRear = !hasLight(false);
+  if (!doFront && !doRear) return parts;
+  const out = [];
+  let nFront = 0, nRear = 0;
+  for (const p of parts) {
+    if (![CLS.GENERIC, CLS.PLASTIC].includes(p.cls) || !p.F.length) { out.push(p); continue; }
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (let i = 0; i < p.V.length; i += 3) {
+      x0 = Math.min(x0, p.V[i]); x1 = Math.max(x1, p.V[i]);
+      y0 = Math.min(y0, p.V[i + 1]); y1 = Math.max(y1, p.V[i + 1]);
+    }
+    const front = doFront && x0 > 0.62, rear = doRear && x1 < -0.62;
+    if ((!front && !rear) || y1 - y0 > 0.35 * carH || y0 < 0.2 * carH || y1 > 0.8 * carH) { out.push(p); continue; }
+    const nf = p.F.length / 3, lamp = new Uint8Array(nf);
+    const matCol = linToSrgb(p.mat.color);
+    let n = 0;
+    for (let f = 0; f < nf; f++) {
+      const c = p.faceCol ? faceColor(p, f) : matCol;
+      const ok = front ? ((dot3(c, LUM) > 0.45 && ptp3(c) < 0.15) || isAmber(c)) : (isRed(c) || isReddish(c));
+      if (ok) { lamp[f] = 1; n++; }
+    }
+    if (!n) { out.push(p); continue; }
+    // the whole part when most of it qualifies (no ragged split), else only those faces
+    const whole = n >= 0.5 * nf;
+    const pieces = whole ? [[null, true]] : [[lamp, true], [lamp.map((v) => 1 - v), false]];
+    for (const [m, isLamp] of pieces) {
+      const sm = m ? subMesh(p.V, p.F, m) : { V: p.V, F: p.F };
+      if (!sm.F.length) continue;
+      let fc = null;
+      if (p.faceCol && m) {
+        fc = new Float32Array(sm.F.length);
+        let q = 0;
+        for (let f = 0; f < nf; f++) if (m[f]) { fc[q++] = p.faceCol[3 * f]; fc[q++] = p.faceCol[3 * f + 1]; fc[q++] = p.faceCol[3 * f + 2]; }
+      } else if (!m) fc = p.faceCol;
+      if (!isLamp) { out.push({ ...p, V: sm.V, F: sm.F, faceCol: fc }); continue; }
+      const cls = front ? CLS.LIGHT_CLEAR : CLS.LIGHT_RED;
+      let col = front ? [1, 1, 1] : matCol;
+      if (front && isAmber(matCol)) col = [1.0, 0.55, 0.08];
+      if (!front && !isRed(matCol)) col = [0.8, 0.05, 0.04];
+      out.push({ ...p, V: sm.V, F: sm.F, faceCol: fc, cls, mat: { ...p.mat, color: srgbToLin(col), name: p.mat.name + (front ? '_head' : '_tail') } });
+      if (front) nFront += sm.F.length / 3; else nRear += sm.F.length / 3;
+    }
+  }
+  if (nFront || nRear) log(`  lamps found by position: ${nFront} head light, ${nRear} tail light triangles`);
+  return out;
+}
+
+// transparent shells lying on an opaque surface (clear coat over the paint, decal films):
+// the renderer has no transparency, both layers would fight for the same pixels
+function dropOverlayShells(parts, log, tol = 0.012) {
+  const isLight = (p) => p.cls === CLS.LIGHT_RED || p.cls === CLS.LIGHT_CLEAR;
+  const cand = parts.filter((p) => p.mat.alpha < 0.6 && !isLight(p) && p.cls !== CLS.GLASS && p.F.length);
+  if (!cand.length) return parts;
+  const pts = [];
+  for (const p of parts) {
+    if (p.mat.alpha < 0.6 || p.cls === CLS.GLASS || !p.F.length) continue;
+    pts.push(p.V);
+    const nf = p.F.length / 3, c = new Float64Array(nf * 3);
+    for (let f = 0; f < nf; f++)
+      for (let k = 0; k < 3; k++) c[3 * f + k] = (p.V[3 * p.F[3 * f] + k] + p.V[3 * p.F[3 * f + 1] + k] + p.V[3 * p.F[3 * f + 2] + k]) / 3;
+    pts.push(c);
+  }
+  if (!pts.length) return parts;
+  const grid = new PointGrid(concatF64(pts), tol);
+  const drop = new Set();
+  for (const p of cand) {
+    const nf = p.F.length / 3, area = faceAreas(p.V, p.F);
+    let near = 0, tot = 0;
+    for (let f = 0; f < nf; f++) {
+      const c = [0, 1, 2].map((k) => (p.V[3 * p.F[3 * f] + k] + p.V[3 * p.F[3 * f + 1] + k] + p.V[3 * p.F[3 * f + 2] + k]) / 3);
+      grid.nearest(c[0], c[1], c[2], tol);
+      if (grid.lastDist <= tol) near += area[f];
+      tot += area[f];
+    }
+    if (tot > 0 && near >= 0.6 * tot) drop.add(p);
+  }
+  if (!drop.size) return parts;
+  log(`  removed transparent overlay layer(s): ${[...new Set([...drop].map((p) => p.mat.name))].join(', ')}`);
+  return parts.filter((p) => !drop.has(p));
 }
 
 // --------------------------------------------------------------------------------------
@@ -405,6 +549,7 @@ function lampFrontSign(parts, R) {
   const xr = [], wr = [], xw = [], ww = [];
   let any = false;
   for (const p of parts) {
+    if (p.cls === CLS_DROP) continue;
     const atlas = [CLS.GENERIC, CLS.PLASTIC, CLS.PAINT].includes(p.cls);
     if (![CLS.LIGHT_RED, CLS.LIGHT_CLEAR, CLS.GLASS].includes(p.cls) && !atlas) continue;
     any = true;
@@ -446,9 +591,10 @@ function normaliseOrientation(parts, cfg) {
   if (up === 'z') R = [[1, 0, 0], [0, 0, 1], [0, -1, 0]];
   else if (up === '-z') R = [[1, 0, 0], [0, 0, -1], [0, 1, 0]];
   else if (up === 'x') R = [[0, 1, 0], [-1, 0, 0], [0, 0, 1]];
-  const bounds = (R) => {
+  const bounds = (R, only) => {
     const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
-    for (const p of parts) {
+    for (const p of only ? [only] : parts) {
+      if (!only && p.cls === CLS_DROP) continue;
       const V = p.V0, n = V.length / 3;
       for (let i = 0; i < n; i++) {
         const x = V[3 * i], y = V[3 * i + 1], z = V[3 * i + 2];
@@ -462,9 +608,34 @@ function normaliseOrientation(parts, cfg) {
     return [mn, mx];
   };
   let [mn, mx] = bounds(R);
+  // ground / shadow planes: flat parts at the very bottom covering most of the footprint
+  {
+    const H = mx[1] - mn[1], A = (mx[0] - mn[0]) * (mx[2] - mn[2]);
+    const ground = [];
+    for (const p of parts) {
+      if (p.cls === CLS_DROP) continue;
+      const [a, b] = bounds(R, p);
+      if (b[1] - a[1] <= 0.02 * H && b[1] <= mn[1] + 0.03 * H && (b[0] - a[0]) * (b[2] - a[2]) >= 0.25 * A) ground.push(p);
+    }
+    if (ground.length && ground.length < parts.filter((p) => p.cls !== CLS_DROP).length) {
+      const saved = ground.map((p) => p.cls);
+      ground.forEach((p) => { p.cls = CLS_DROP; });
+      const [m2, x2] = bounds(R);
+      const L2 = Math.max(x2[0] - m2[0], x2[2] - m2[2]);
+      if (x2[1] - m2[1] >= 0.05 * L2) {
+        cfg._log?.(`  removed ground plane: ${ground.map((p) => p.name).join(', ')}`);
+        [mn, mx] = [m2, x2];
+      } else ground.forEach((p, i) => { p.cls = saved[i]; });      // the plane is the model
+    }
+  }
   const ext = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
   const kind = cfg.kind || 'auto';
-  const isCar = kind === 'car' || (kind === 'auto' && parts.some((p) => [CLS.TIRE, CLS.LIGHT_RED, CLS.LIGHT_CLEAR].includes(p.cls)));
+  // car: tyres or lights found by name, or a body paint material on a car shaped model
+  const Lh = Math.max(ext[0], ext[2]), Wh = Math.min(ext[0], ext[2]);
+  const carShape = Wh > 0 && ext[1] > 0 && Lh / Wh >= 1.5 && Lh / Wh <= 3.4 && Lh / ext[1] >= 1.7 && Lh / ext[1] <= 4.5;
+  const live = parts.filter((p) => p.cls !== CLS_DROP);
+  const isCar = kind === 'car' || (kind === 'auto' && (live.some((p) => [CLS.TIRE, CLS.LIGHT_RED, CLS.LIGHT_CLEAR].includes(p.cls))
+    || (carShape && live.some((p) => p.cls === CLS.PAINT))));
   cfg._isCar = isCar;
   if (!isCar) R = matMul(rotY(90), R);
   else if (ext[2] > ext[0]) R = matMul(rotY(-90), R);
@@ -633,7 +804,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
 
   let parts = inputParts.filter((p) => p.F && p.F.length >= 3).map((p) => ({
     name: p.name || 'part', mat: { ...p.mat }, V0: Float64Array.from(p.V), F: Uint32Array.from(p.F),
-    faceCol: p.faceCol || null,
+    faceCol: p.faceCol || null, texDetail: !!p.faceCol,
   }));
   if (!parts.length) throw new Error('No triangle meshes found in the file');
   log(`  ${parts.length} parts, ${parts.reduce((s, p) => s + p.F.length / 3, 0)} triangles`);
@@ -647,18 +818,35 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     if (ov !== undefined && (ov === 'drop' || CLS_NAMES.includes(ov))) p.cls = ov === 'drop' ? CLS_DROP : CLS_NAMES.indexOf(ov);
     else p.cls = classify(p);
   }
+  cfg._log = log;
   normaliseOrientation(parts, cfg);
+  delete cfg._log;
   for (const p of parts) delete p.V0;
   parts = parts.filter((p) => p.cls !== CLS_DROP);
   log(`  mode: ${cfg._isCar ? 'car' : 'object'}`);
+  parts = dropOverlayShells(parts, log);
   parts = applyTextureSplit(parts, cfg._isCar, texColors, log);
-  if (cfg._isCar) parts = dropLampCovers(parts, log);
+  if (cfg._isCar) {
+    parts = lampsByPosition(parts, log);
+    parts = dropLampCovers(parts, log);
+  }
   let ndup = 0;
   for (const p of parts) {
+    const vc = p.faceCol && p.texDetail ? vertexColors(p) : null;
     const w = weld(p.V, p.F, 1e-6);
     const Fd = dedupeFaces(w.F);
     ndup += (w.F.length - Fd.length) / 3;
     fixWinding(Fd, w.V.length / 3);
+    p.vcol = null;
+    if (vc) {                                  // average the colours of welded vertices
+      const n2 = w.V.length / 3, acc = new Float64Array(n2 * 4);
+      for (let i = 0; i < w.inv.length; i++) {
+        const r = w.inv[i];
+        acc[4 * r] += vc[3 * i]; acc[4 * r + 1] += vc[3 * i + 1]; acc[4 * r + 2] += vc[3 * i + 2]; acc[4 * r + 3]++;
+      }
+      p.vcol = new Float32Array(n2 * 3);
+      for (let r = 0; r < n2; r++) for (let c = 0; c < 3; c++) p.vcol[3 * r + c] = acc[4 * r + c] / Math.max(acc[4 * r + 3], 1);
+    }
     p.V = w.V; p.F = Fd; p.faceCol = null;
   }
   parts = parts.filter((p) => p.F.length);
@@ -666,6 +854,13 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
 
   // ---- global arrays
   let { V, F, owner } = joinParts(parts);
+  // linear texture colour per vertex (-1 = no texture), for the texture detail below
+  const hiCol = new Float32Array(V.length).fill(-1);
+  {
+    let o = 0;
+    for (const p of parts) { if (p.vcol) hiCol.set(p.vcol, o); p.hiRange = [o / 3, p.V.length / 3]; o += p.V.length; p.vcol = null; }
+  }
+  const hiV = V;
   let radius = 0;
   for (let i = 0; i < V.length; i += 3) radius = Math.max(radius, Math.hypot(V[i], V[i + 1], V[i + 2]));
   radius *= 1.02;
@@ -805,7 +1000,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     if (!any) return;
     const sm = subMesh(DV, DF, m);
     const p = parts[q.part];
-    outParts.push({ name: p.name, cls: p.cls, mat: p.mat, V: sm.V, F: sm.F, twosided: !!p.twosided });
+    outParts.push({ name: p.name, cls: p.cls, mat: p.mat, V: sm.V, F: sm.F, twosided: !!p.twosided, texDetail: !!p.texDetail, hiRange: p.hiRange });
   });
   log(`  after decimation: ${outParts.reduce((s, p) => s + p.F.length / 3, 0)} triangles`);
   progress('Simplifying', 1);
@@ -861,7 +1056,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   if (opts.paint) paintLin = parseColor(opts.paint);
   else if (cfg.paint) paintLin = parseColor(cfg.paint);
 
-  const allV = [], allN = [], allF = [], mats = [];
+  const allV = [], allN = [], allF = [], mats = [], details = [];
   let vo = 0, to = 0;
   for (const { cls, list } of groups.values()) {
     const j = joinParts(list);
@@ -878,6 +1073,36 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     for (let k = 0; k < cn.F.length; k++) Fo[k] = cn.F[k] + vo;
     allF.push(Fo);
     const dsided = list.some((p) => p.twosided) || cls === CLS.GLASS;
+    // texture detail: brightness changes inside a colour region go into the per-vertex light
+    // factor (the region itself has one colour), so a textured surface keeps its shading
+    let detail = null;
+    if (TEX_DETAIL_CLS.includes(cls) && list.some((p) => p.texDetail) && !(cls === CLS.PAINT && paintLin)) {
+      // look the colour up among the source vertices of this material only (a vertex on a
+      // region border exists once per region, each with its own colour)
+      const idx = [];
+      for (const p of list) if (p.hiRange) for (let k = 0; k < p.hiRange[1]; k++) idx.push(p.hiRange[0] + k);
+      const sub = new Float64Array(idx.length * 3);
+      idx.forEach((k, i) => { sub[3 * i] = hiV[3 * k]; sub[3 * i + 1] = hiV[3 * k + 1]; sub[3 * i + 2] = hiV[3 * k + 2]; });
+      const g2 = new PointGrid(sub, 1e-4);
+      const nvg = cn.V.length / 3, lum = new Float64Array(nvg).fill(-1);
+      for (let i = 0; i < nvg; i++) {
+        const q = g2.nearest(cn.V[3 * i], cn.V[3 * i + 1], cn.V[3 * i + 2], 1e-5);
+        const k = q >= 0 ? idx[q] : -1;
+        if (k >= 0 && hiCol[3 * k] >= 0) lum[i] = hiCol[3 * k] * LUM[0] + hiCol[3 * k + 1] * LUM[1] + hiCol[3 * k + 2] * LUM[2];
+      }
+      const valid = [...lum].filter((v) => v >= 0).sort((x, y) => x - y);
+      if (valid.length > 8) {
+        const ref = valid[Math.floor(valid.length * 0.92)], mean = valid.reduce((s2, v) => s2 + v, 0) / valid.length;
+        if (ref > 1e-4 && mean > 1e-4) {
+          detail = new Float64Array(nvg);
+          for (let i = 0; i < nvg; i++) detail[i] = lum[i] < 0 ? 1 : Math.min(1, Math.max(0.3, lum[i] / ref));
+          // the region colour becomes the bright end; the factor darkens towards the texture
+          const sc = Math.min(ref / mean, 1 / Math.max(color[0], color[1], color[2], 1e-6));
+          color = color.map((c2) => c2 * sc);
+        }
+      }
+    }
+    details.push(detail);
     mats.push({ cls, color, rough, triStart: to, triCount: cn.F.length / 3, dsided,
       names: [...new Set(list.map((p) => p.mat.name))].sort() });
     vo += cn.V.length / 3; to += cn.F.length / 3;
@@ -902,6 +1127,13 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     log('  baking ambient occlusion ...');
     progress('Baking ambient occlusion', 0);
     ao = bakeAO(V, N, F, radius, 128, 512, true, (f) => progress('Baking ambient occlusion', f));
+  }
+  {
+    let o = 0;
+    details.forEach((d) => {
+      if (d) for (let i = 0; i < d.length; i++) ao[o + i] *= d[i];
+      o += d ? d.length : 0;
+    });
   }
 
   // ---- matcaps

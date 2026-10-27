@@ -66,6 +66,9 @@ CLS_IMPORTANCE = {CLS_PAINT: 2.6, CLS_GLASS: 1.1, CLS_CHROME: 1.0, CLS_METAL: 0.
 # matcap resolution per class (128 for large glossy surfaces)
 CLS_MATCAP = {CLS_PAINT: 128, CLS_GLASS: 128, CLS_CHROME: 128}
 
+# classes whose texture brightness detail is kept per vertex
+TEX_DETAIL_CLS = (CLS_GENERIC, CLS_PLASTIC, CLS_INTERIOR, CLS_PAINT)
+
 MAGIC = b"R3DM"
 VERSION = 2
 
@@ -178,19 +181,20 @@ def face_texture_colors(geom):
     return col
 
 
-def split_by_texture(geom, max_colors):
-    """Cluster texture colours into regions. Returns per-face labels and region sRGB colours."""
+def split_by_texture(V, F, col, max_colors, l_weight=1.0):
+    """Cluster per-face texture colours into regions. Returns per-face labels and region sRGB
+    colours. l_weight < 1: regions follow hue more than brightness (objects, where the
+    brightness detail is kept per vertex)."""
     from scipy.cluster.vq import kmeans2
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
-    col = face_texture_colors(geom)
     if col is None:
         return None, None
-    F = np.asarray(geom.faces)
-    V = np.asarray(geom.vertices)
+    F = np.asarray(F)
+    V = np.asarray(V)
     area = np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1) * 0.5
     lab = _srgb_to_oklab(col)
-    lab_w = lab * np.array([1.0, 1.6, 1.6])          # hue matters more than shading in the bake
+    lab_w = lab * np.array([l_weight, 1.6, 1.6])     # hue matters more than shading in the bake
     rng = np.random.default_rng(1)
     n_fit = min(len(F), 40000)
     sel = rng.choice(len(F), n_fit, p=area / area.sum())
@@ -203,8 +207,10 @@ def split_by_texture(geom, max_colors):
             keep.append(c)
     cent = np.array(keep)
     lbl = np.argmin(((lab_w[:, None, :] - cent[None]) ** 2).sum(-1), axis=1)
-    # smooth labels over the surface: majority of edge neighbours (removes texture noise)
-    adj = trimesh.graph.face_adjacency(F)
+    # smooth labels over the surface: majority of edge neighbours (removes texture noise);
+    # adjacency over position-welded vertices so UV seams do not break it
+    _, inv = np.unique(np.round(V / 1e-6).astype(np.int64), axis=0, return_inverse=True)
+    adj = trimesh.graph.face_adjacency(inv.reshape(-1)[F])
     for _ in range(4):
         cnt = np.zeros((len(F), len(cent)))
         np.add.at(cnt, (adj[:, 0], lbl[adj[:, 1]]), 1)
@@ -266,20 +272,25 @@ def _is_reddish(srgb):
 
 def drop_lamp_covers(parts, dist=0.05):
     """Transparent lenses over head/tail lights: the renderer has no transparency, so a
-    lens would hide the lamp behind it as a dark pane. Glass triangles lying on top of
-    light geometry (closer than `dist`, car length = 2) are removed; windows stay."""
+    lens would hide the lamp behind it as a dark pane. Removed: glass triangles lying on top
+    of light geometry (closer than `dist`, car length = 2) and glass at the front / rear end
+    below the window line (lamp lenses). Windows stay."""
     lights = [p for p in parts if p["cls"] in (CLS_LIGHT_RED, CLS_LIGHT_CLEAR) and len(p["F"])]
-    if not lights:
-        return parts
-    pts = np.concatenate([np.concatenate([p["V"], p["V"][p["F"]].mean(1)]) for p in lights])
-    tree = cKDTree(pts)
+    car_h = max(float(p["V"][:, 1].max()) for p in parts if len(p["V"]))
+    tree = None
+    if lights:
+        pts = np.concatenate([np.concatenate([p["V"], p["V"][p["F"]].mean(1)]) for p in lights])
+        tree = cKDTree(pts)
     out, dropped = [], 0
     for p in parts:
         if p["cls"] != CLS_GLASS or not len(p["F"]):
             out.append(p)
             continue
-        d, _ = tree.query(p["V"][p["F"]].mean(1))
-        keep = d > dist
+        cen = p["V"][p["F"]].mean(1)
+        keep = ~((np.abs(cen[:, 0]) > 0.5) & (cen[:, 1] < 0.6 * car_h))
+        if tree is not None:
+            d, _ = tree.query(cen)
+            keep &= d > dist
         dropped += int((~keep).sum())
         if keep.all():
             out.append(p)
@@ -289,10 +300,100 @@ def drop_lamp_covers(parts, dist=0.05):
             used = np.unique(Fp)
             remap = -np.ones(len(p["V"]), np.int64); remap[used] = np.arange(len(used))
             q = dict(p); q["V"], q["F"] = p["V"][used], remap[Fp]
-            q.pop("tex_geom", None)
+            q.pop("tex_geom", None); q["fcol"] = None; q["tex_detail"] = False
             out.append(q)
     if dropped:
         log(f"  removed {dropped} lamp-lens glass triangles (lamps visible)")
+    return out
+
+
+def drop_overlay_shells(parts, tol=0.012):
+    """Transparent shells lying on an opaque surface (clear coat over the paint, decal films):
+    without transparency both layers would fight for the same pixels."""
+    cand = [p for p in parts if p["mat"]["alpha"] < 0.6 and len(p["F"]) and
+            p["cls"] not in (CLS_GLASS, CLS_LIGHT_RED, CLS_LIGHT_CLEAR)]
+    opaque = [p for p in parts if p["mat"]["alpha"] >= 0.6 and p["cls"] != CLS_GLASS and len(p["F"])]
+    if not cand or not opaque:
+        return parts
+    tree = cKDTree(np.concatenate([np.concatenate([p["V"], p["V"][p["F"]].mean(1)]) for p in opaque]))
+    drop = set()
+    for p in cand:
+        V, F = p["V"], p["F"]
+        area = np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1)
+        d, _ = tree.query(V[F].mean(1), distance_upper_bound=tol * 1.0001)
+        if area.sum() > 0 and area[d <= tol].sum() >= 0.6 * area.sum():
+            drop.add(id(p))
+    if drop:
+        log("  removed transparent overlay layer(s): " +
+            ", ".join(sorted({p["mat"]["name"] for p in parts if id(p) in drop})))
+    return [p for p in parts if id(p) not in drop]
+
+
+def lamps_by_position(parts):
+    """Cars whose lamps have no telling names: small parts at the very front / rear, bright
+    neutral (or amber) at the front = headlights, red at the rear = tail lights. Only for an
+    end of the car where no lamp was found by name."""
+    car_h = max(float(p["V"][:, 1].max()) for p in parts if len(p["V"]))
+    def has_light(front):
+        for p in parts:
+            if p["cls"] in (CLS_LIGHT_CLEAR, CLS_LIGHT_RED) and not p.get("from_split") and len(p["V"]):
+                if (p["V"][:, 0].mean() > 0) == front:
+                    return True
+        return False
+    do_front, do_rear = not has_light(True), not has_light(False)
+    if not do_front and not do_rear:
+        return parts
+    out, nf_, nr_ = [], 0, 0
+    for p in parts:
+        if p["cls"] not in (CLS_GENERIC, CLS_PLASTIC) or not len(p["F"]):
+            out.append(p)
+            continue
+        V, F = p["V"], p["F"]
+        front = do_front and V[:, 0].min() > 0.62
+        rear = do_rear and V[:, 0].max() < -0.62
+        y0, y1 = V[:, 1].min(), V[:, 1].max()
+        if (not front and not rear) or y1 - y0 > 0.35 * car_h or y0 < 0.2 * car_h or y1 > 0.8 * car_h:
+            out.append(p)
+            continue
+        mat_col = linear_to_srgb(p["mat"]["color"])
+        col = p.get("fcol")
+        if col is None or len(col) != len(F):
+            col = np.tile(mat_col, (len(F), 1))
+        lum = col @ np.array([0.2126, 0.7152, 0.0722])
+        if front:
+            lamp = ((lum > 0.45) & (np.ptp(col, axis=1) < 0.15)) | np.array([_is_amber(c) for c in col])
+        else:
+            lamp = np.array([_is_red(c) or _is_reddish(c) for c in col])
+        if not lamp.any():
+            out.append(p)
+            continue
+        masks = [(np.ones(len(F), bool), True)] if lamp.sum() >= 0.5 * len(F) else [(lamp, True), (~lamp, False)]
+        for m, is_lamp in masks:
+            if not m.any():
+                continue
+            Fp = F[m]
+            used = np.unique(Fp)
+            remap = -np.ones(len(V), np.int64); remap[used] = np.arange(len(used))
+            q = dict(p); q["V"], q["F"] = V[used], remap[Fp]
+            if not m.all():
+                q.pop("tex_geom", None)
+                if p.get("fcol") is not None:
+                    q["fcol"] = p["fcol"][m]
+            if is_lamp:
+                c = np.ones(3) if front else mat_col
+                if front and _is_amber(mat_col):
+                    c = np.array([1.0, 0.55, 0.08])
+                if not front and not _is_red(mat_col):
+                    c = np.array([0.8, 0.05, 0.04])
+                q["cls"] = CLS_LIGHT_CLEAR if front else CLS_LIGHT_RED
+                q["mat"] = dict(p["mat"], color=srgb_to_linear(c), name=p["mat"]["name"] + ("_head" if front else "_tail"))
+                if front:
+                    nf_ += len(Fp)
+                else:
+                    nr_ += len(Fp)
+            out.append(q)
+    if nf_ or nr_:
+        log(f"  lamps found by position: {nf_} head light, {nr_} tail light triangles")
     return out
 
 
@@ -348,16 +449,61 @@ def atlas_region_class(srgb, cx):
     return CLS_GENERIC, srgb
 
 
-def _is_atlas(geom, n_faces):
+def _is_atlas(col, n_faces):
     """A textured car material whose texture holds very different surfaces (trim + lights +
     windows) - its average colour would be meaningless."""
     if n_faces < 1500:
         return False
-    col = face_texture_colors(geom)
     if col is None:
         return False
     lum = col @ np.array([0.2126, 0.7152, 0.0722])
     return float(lum.std()) > 0.12 or float((np.ptp(col, axis=1) > 0.25).mean()) > 0.02
+
+
+def part_face_colors(p):
+    """per-face sRGB texture colours of a part (cached), None without texture"""
+    if "fcol" not in p:
+        col = None
+        if p.get("tex_geom") is not None:
+            try:
+                col = face_texture_colors(p["tex_geom"])
+            except Exception:
+                col = None
+        p["fcol"] = col if col is not None and len(col) == len(p["F"]) else None
+        p["tex_detail"] = p["fcol"] is not None
+    return p["fcol"]
+
+
+def merge_by_material(parts):
+    """objects: textured parts of one material are clustered together (consistent regions)"""
+    groups, order = {}, []
+    for p in parts:
+        if part_face_colors(p) is None:
+            order.append(p)
+            continue
+        k = (p["mat"]["name"], p["cls"])
+        if k not in groups:
+            groups[k] = []
+            order.append(k)
+        groups[k].append(p)
+    out = []
+    for e in order:
+        if isinstance(e, dict):
+            out.append(e)
+            continue
+        pl = groups[e]
+        if len(pl) == 1:
+            out.append(pl[0])
+            continue
+        offs = np.cumsum([0] + [len(q["V"]) for q in pl])[:-1]
+        q = dict(pl[0])
+        q["V"] = np.concatenate([x["V"] for x in pl])
+        q["F"] = np.concatenate([x["F"] + o for x, o in zip(pl, offs)])
+        q["fcol"] = np.concatenate([x["fcol"] for x in pl])
+        q["tex_detail"] = True
+        q.pop("tex_geom", None)
+        out.append(q)
+    return out
 
 
 def apply_texture_split(parts, is_car, max_colors):
@@ -367,28 +513,29 @@ def apply_texture_split(parts, is_car, max_colors):
                  texture atlases (trim + lights + windows in one texture). Each region is
                  classified by colour and position on the car. Other car materials keep their
                  averaged colour: they are classified by name."""
+    for p in parts:
+        part_face_colors(p)
     if max_colors <= 1:
         return parts
+    if not is_car:
+        parts = merge_by_material(parts)
     car_h = max(float(p["V"][:, 1].max()) for p in parts if len(p["V"])) if is_car else 1.0
     out = []
     for p in parts:
-        geom = p.get("tex_geom")
+        fcol = p.get("fcol")
         mode = None
-        if geom is not None:
+        if fcol is not None:
             if not is_car:
                 mode = "object"
             elif p["cls"] in (CLS_LIGHT_RED, CLS_LIGHT_CLEAR):
                 mode = "light"
             elif p["cls"] in (CLS_GENERIC, CLS_PLASTIC, CLS_PAINT, CLS_INTERIOR):
-                try:
-                    mode = "atlas" if _is_atlas(geom, len(p["F"])) else None
-                except Exception:
-                    mode = None
+                mode = "atlas" if _is_atlas(fcol, len(p["F"])) else None
         lbl = colors = None
         if mode:
             try:
                 k = max_colors if mode == "object" else (min(max_colors, 6) if mode == "light" else min(max_colors, 10))
-                lbl, colors = split_by_texture(geom, k)
+                lbl, colors = split_by_texture(p["V"], p["F"], fcol, k, 0.5 if mode == "object" else 1.0)
             except Exception as e:                     # never fail the conversion because of it
                 log(f"  texture split skipped for '{p['name']}': {e}")
         if lbl is None or colors is None or len(colors) < 2 or len(lbl) != len(p["F"]):
@@ -425,7 +572,7 @@ def apply_texture_split(parts, is_car, max_colors):
                 mi["color"] = srgb_to_linear(np.asarray(col))
                 mi["name"] = f"{p['mat']['name']}_c{r}{'abcd'[j] if len(pieces) > 1 else ''}"
                 out.append(dict(name=f"{p['name']}_c{r}_{j}", mat=mi, cls=cls, V=p["V"][used],
-                                F=remap[Fp], from_split=True))
+                                F=remap[Fp], from_split=True, fcol=fcol[m], tex_detail=True))
                 summary.append(f"{CLS_NAMES[cls]}:{int(m.sum())}")
         log(f"  '{p['name'][:40]}' ({mode}): {len(colors)} colour regions -> {' '.join(summary)}")
     return out
@@ -445,7 +592,7 @@ RULES = [
     (CLS_TIRE, r"tire|tyre|rubber|reifen|opon|guma|llanta"),
     (CLS_CARBON, r"carbon"),
     (CLS_METAL, r"rim|wheel|alloy|felge|disc|disk|brake|caliper|metal|steel|alu|exhaust|felg"),
-    (CLS_PAINT, r"paint|body|carpaint|car_paint|lack|karoser|exterior|coat"),
+    (CLS_PAINT, r"paint|body|carpaint|car_paint|(?<![a-z])lack|karoser|exterior|coat"),
     (CLS_PLASTIC, r"plastic|trim|black|grill|grille|bumper_low|matte|kunststoff"),
 ]
 
@@ -593,15 +740,27 @@ def visible_triangles(V, F, radius, n_views=64, res=640, min_elev=-0.35):
 # --------------------------------------------------------------------------------------
 # Mesh processing
 # --------------------------------------------------------------------------------------
-def weld(V, F, tol):
+def weld(V, F, tol, return_inv=False):
     q = np.round(V / tol).astype(np.int64)
-    _, inv, uniq_idx = None, None, None
     keys, first, inv = np.unique(q, axis=0, return_index=True, return_inverse=True)
     inv = inv.reshape(-1)
     V2 = V[first]
     F2 = inv[F]
     good = (F2[:, 0] != F2[:, 1]) & (F2[:, 1] != F2[:, 2]) & (F2[:, 0] != F2[:, 2])
+    if return_inv:
+        return V2, F2[good], inv
     return V2, F2[good]
+
+
+def vertex_colors(V, F, fcol):
+    """linear per-vertex colour from per-face sRGB colours (area weighted)"""
+    area = np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1) + 1e-12
+    lin = srgb_to_linear(fcol) * area[:, None]
+    acc = np.zeros((len(V), 3)); w = np.zeros(len(V))
+    for k in range(3):
+        np.add.at(acc, F[:, k], lin)
+        np.add.at(w, F[:, k], area)
+    return acc / np.maximum(w, 1e-12)[:, None]
 
 
 def meshopt_simplify(V, F, target, lock_border=False):
@@ -865,6 +1024,8 @@ def lamp_front_sign(parts, R):
     surfaces are tail lights, bright neutral surfaces are headlights."""
     xs_red, w_red, xs_wht, w_wht = [], [], [], []
     for p in parts:
+        if p["cls"] == CLS_DROP:
+            continue
         atlas = p["cls"] in (CLS_GENERIC, CLS_PLASTIC, CLS_PAINT) and p.get("tex_geom") is not None
         if p["cls"] not in (CLS_LIGHT_RED, CLS_LIGHT_CLEAR, CLS_GLASS) and not atlas:
             continue
@@ -917,10 +1078,35 @@ def normalise_orientation(parts, cfg):
     elif up == "x":
         R = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=np.float64)
     V = allV @ R.T
+    # ground / shadow planes: flat parts at the very bottom covering most of the footprint
+    mn, mx = V.min(0), V.max(0)
+    H, A = mx[1] - mn[1], (mx[0] - mn[0]) * (mx[2] - mn[2])
+    ground = []
+    for p in parts:
+        if p["cls"] == CLS_DROP:
+            continue
+        Pv = p["mesh"].vertices @ R.T
+        a, b = Pv.min(0), Pv.max(0)
+        if b[1] - a[1] <= 0.02 * H and b[1] <= mn[1] + 0.03 * H and (b[0] - a[0]) * (b[2] - a[2]) >= 0.25 * A:
+            ground.append(p)
+    live = [p for p in parts if p["cls"] != CLS_DROP and all(p is not g for g in ground)]
+    if ground and live:
+        V2 = np.concatenate([p["mesh"].vertices for p in live]) @ R.T
+        e2 = V2.max(0) - V2.min(0)
+        if e2[1] >= 0.05 * max(e2[0], e2[2]):
+            for g in ground:
+                g["cls"] = CLS_DROP
+            log("  removed ground plane: " + ", ".join(g["name"] for g in ground))
+    live = [p for p in parts if p["cls"] != CLS_DROP]
+    allV = np.concatenate([p["mesh"].vertices for p in live])
+    V = allV @ R.T
     ext = V.max(0) - V.min(0)
+    Lh, Wh = max(ext[0], ext[2]), min(ext[0], ext[2])
+    car_shape = Wh > 0 and ext[1] > 0 and 1.5 <= Lh / Wh <= 3.4 and 1.7 <= Lh / ext[1] <= 4.5
     is_car = cfg.get("kind", "auto") == "car" or (
         cfg.get("kind", "auto") == "auto" and
-        any(p["cls"] in (CLS_TIRE, CLS_LIGHT_RED, CLS_LIGHT_CLEAR) for p in parts))
+        (any(p["cls"] in (CLS_TIRE, CLS_LIGHT_RED, CLS_LIGHT_CLEAR) for p in live) or
+         (car_shape and any(p["cls"] == CLS_PAINT for p in live))))
     cfg["_is_car"] = is_car
     if not is_car:
         # generic object (figure, toy, ...): glTF convention, front faces +Z -> viewer front +X
@@ -987,12 +1173,21 @@ def convert(args):
     normalise_orientation(parts, cfg)
     parts = [p for p in parts if p["cls"] != CLS_DROP]
     log(f"  mode: {'car' if cfg['_is_car'] else 'object'}")
+    parts = drop_overlay_shells(parts)
     parts = apply_texture_split(parts, cfg["_is_car"], args.tex_colors)
     if cfg["_is_car"]:
+        parts = lamps_by_position(parts)
         parts = drop_lamp_covers(parts)
     ndup = 0
     for p in parts:
-        Vw, Fw = weld(p["V"], p["F"], 1e-6)
+        vc = vertex_colors(p["V"], p["F"], p["fcol"]) if p.get("fcol") is not None and p.get("tex_detail") else None
+        Vw, Fw, winv = weld(p["V"], p["F"], 1e-6, return_inv=True)
+        p["vcol"] = None
+        if vc is not None:                  # average the colours of welded vertices
+            acc = np.zeros((len(Vw), 3)); cnt = np.zeros(len(Vw))
+            np.add.at(acc, winv, vc); np.add.at(cnt, winv, 1)
+            p["vcol"] = acc / np.maximum(cnt, 1)[:, None]
+        p["fcol"] = None
         Fd = dedupe_faces(Fw)
         ndup += len(Fw) - len(Fd)
         # make winding consistent inside every connected patch (orientation decided later)
@@ -1012,6 +1207,16 @@ def convert(args):
         offs += len(p["V"])
     V = np.concatenate(Vs); F = np.concatenate(Fs); owner = np.concatenate(owner)
     radius = float(np.linalg.norm(V, axis=1).max()) * 1.02
+    # linear texture colour per vertex (-1 = no texture) for the texture detail further down
+    hiCol = -np.ones_like(V)
+    o = 0
+    for p in parts:
+        if p.get("vcol") is not None:
+            hiCol[o:o + len(p["V"])] = p["vcol"]
+        p["hi_range"] = (o, len(p["V"]))
+        p["vcol"] = None
+        o += len(p["V"])
+    hiV = V
 
     # ---- hidden surface removal
     if not args.keep_hidden:
@@ -1165,6 +1370,7 @@ def convert(args):
         remap = -np.ones(len(DV), np.int64); remap[used] = np.arange(len(used))
         p = parts[i]
         out_parts.append(dict(name=p["name"], cls=p["cls"], mat=p["mat"], V=DV[used], F=remap[Fk],
+                              tex_detail=bool(p.get("tex_detail")), hi_range=p.get("hi_range"),
                               twosided=p.get("twosided", False)))
     log(f"  after decimation: {sum(len(p['F']) for p in out_parts)} triangles")
 
@@ -1215,7 +1421,7 @@ def convert(args):
 
     paint_lin = parse_color(args.paint) if args.paint else (parse_color(cfg["paint"]) if "paint" in cfg else None)
 
-    allV, allN, allF, mats = [], [], [], []
+    allV, allN, allF, mats, details = [], [], [], [], []
     lod1_parts = []
     voff, toff = 0, 0
     for key, plist in groups.items():
@@ -1240,6 +1446,23 @@ def convert(args):
         rough = float(np.average([p["mat"]["roughness"] for p in plist], weights=a + 1e-12))
         if cls == CLS_PAINT and paint_lin is not None:
             color = paint_lin
+        # texture detail: brightness changes inside a colour region go into the per-vertex
+        # light factor (the region has one colour), so a textured surface keeps its shading
+        detail = None
+        if cls in TEX_DETAIL_CLS and any(p.get("tex_detail") for p in plist) and not (cls == CLS_PAINT and paint_lin is not None):
+            idx = np.concatenate([np.arange(p["hi_range"][0], p["hi_range"][0] + p["hi_range"][1])
+                                  for p in plist if p.get("hi_range")] or [np.zeros(0, np.int64)])
+            if len(idx):
+                d, q = cKDTree(hiV[idx]).query(Vn)
+                k = idx[np.minimum(q, len(idx) - 1)]
+                lum = np.where((d < 1e-5) & (hiCol[k, 0] >= 0), hiCol[k] @ np.array([0.2126, 0.7152, 0.0722]), -1.0)
+                valid = np.sort(lum[lum >= 0])
+                if len(valid) > 8:
+                    ref = valid[int(len(valid) * 0.92)]; mean = valid.mean()
+                    if ref > 1e-4 and mean > 1e-4:
+                        detail = np.where(lum < 0, 1.0, np.clip(lum / ref, 0.3, 1.0))
+                        color = color * min(ref / mean, 1.0 / max(float(np.max(color)), 1e-6))
+        details.append((len(Vn), detail))
         allV.append(Vn); allN.append(Nn); allF.append(Fn + voff)
         dsided = any(p.get("twosided", False) for p in plist) or cls == CLS_GLASS
         mats.append(dict(cls=cls, color=color, rough=rough, tri_start=toff, tri_count=len(Fn), dsided=dsided,
@@ -1256,6 +1479,11 @@ def convert(args):
     else:
         log("  baking ambient occlusion ...")
         ao = bake_ao(V, N, F, radius)
+    o = 0
+    for n, d in details:
+        if d is not None:
+            ao[o:o + n] = ao[o:o + n] * d
+        o += n
 
     # ---- matcaps
     log("  rendering matcaps ...")

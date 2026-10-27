@@ -218,6 +218,7 @@ export function initStudio(manifest, site) {
     dlog.textContent = (it.log || []).join('\n');
     $('d-settings').hidden = !it.parts;
     fillSettings(it.opts || DEFAULT_OPTS);
+    fillMaterials(it);
     $('d-download').disabled = !it.bytes;
     if (it.bytes) {
       const v = ensureViewer();
@@ -257,6 +258,52 @@ export function initStudio(manifest, site) {
   };
   S.budget.addEventListener('input', () => { $('s-budget-out').textContent = fmtInt(+S.budget.value); });
   S.tex.addEventListener('input', () => { $('s-tex-out').textContent = S.tex.value === '0' ? 'off' : S.tex.value; });
+  // per material class overrides (keyed by the source material names)
+  const CLASS_KEYS = ['paint', 'glass', 'chrome', 'metal', 'tire', 'plastic', 'light_red', 'light_clear', 'interior', 'carbon', 'generic'];
+  const baseName = (n) => n.replace(/(_c\d+[a-d]?|_head|_tail)$/, '');
+  function fillMaterials(it) {
+    const ul = $('s-mats');
+    ul.textContent = '';
+    const ov = (it.opts && it.opts.materials) || {};
+    for (const m of it.report?.materials || []) {
+      const names = [...new Set((m.src || []).map(baseName))];
+      const li = document.createElement('li');
+      const sw = document.createElement('i');
+      sw.style.background = `rgb(${m.color.map((c) => Math.round(c * 255)).join(',')})`;
+      const sel = document.createElement('select');
+      sel.dataset.names = JSON.stringify(names);
+      sel.title = names.join(', ');
+      sel.setAttribute('aria-label', `Material ${names.join(', ')}`);
+      const add = (v, t) => { const o = document.createElement('option'); o.value = v; o.textContent = t; sel.appendChild(o); };
+      add('', `${CLS_LABEL[m.cls] || m.cls} (detected)`);
+      for (const k of CLASS_KEYS) add(k, CLS_LABEL[k]);
+      add('drop', 'remove');
+      const cur = names.map((n) => ov[n.toLowerCase()]).find((v) => v);
+      if (cur) sel.value = cur;
+      li.append(sw, sel);
+      ul.appendChild(li);
+    }
+    $('s-mats').parentElement.hidden = !ul.children.length;
+    const n = Object.keys(ov).length;
+    $('s-mats-reset').hidden = !n;
+    $('s-mats-reset').textContent = `Undo all material changes (${n})`;
+  }
+  $('s-mats-reset').addEventListener('click', () => {
+    if (!selected || !selected.parts) return;
+    selected.opts = { ...readSettings(), materials: {} };
+    convertItem(selected);
+  });
+  function readMaterials(prev) {
+    const ov = { ...(prev || {}) };
+    for (const sel of $('s-mats').querySelectorAll('select')) {
+      for (const n of JSON.parse(sel.dataset.names)) {
+        if (sel.value) ov[n.toLowerCase()] = sel.value;
+        else delete ov[n.toLowerCase()];
+      }
+    }
+    return ov;
+  }
+
   function fillSettings(o) {
     S.budget.value = o.budget; $('s-budget-out').textContent = fmtInt(o.budget);
     S.yaw.value = o.yaw ?? ''; S.up.value = o.up; S.kind.value = o.kind;
@@ -274,7 +321,8 @@ export function initStudio(manifest, site) {
 
   $('d-reconvert').addEventListener('click', () => {
     if (!selected || !selected.parts) return;
-    selected.opts = readSettings();
+    const materials = readMaterials(selected.opts && selected.opts.materials);
+    selected.opts = { ...readSettings(), materials };
     convertItem(selected);
   });
 
@@ -303,7 +351,7 @@ export function initStudio(manifest, site) {
     it.bytes = null;
     if (it === selected) select(it); else render();
     const o = it.opts;
-    const config = { up_axis: o.up, kind: o.kind };
+    const config = { up_axis: o.up, kind: o.kind, materials: o.materials || {} };
     if (o.yaw === 'flip') config.flip_front = true;
     else if (o.yaw !== '' && o.yaw !== undefined) config.yaw_deg = Number(o.yaw);
     const stages = ['Classifying materials', 'Removing hidden geometry', 'Simplifying', 'Baking ambient occlusion', 'Rendering materials'];

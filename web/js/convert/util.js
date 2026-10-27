@@ -292,7 +292,7 @@ export function weld(V, F, tol) {
     if (a === b || b === c || a === c) continue;
     F2[j++] = a; F2[j++] = b; F2[j++] = c;
   }
-  return { V: V2, F: F2.slice(0, j) };
+  return { V: V2, F: F2.slice(0, j), inv };
 }
 
 // remove triangles that use the same 3 vertices (double-sided duplicates)
