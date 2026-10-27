@@ -24,3 +24,6 @@ __pycache__/
 *.pyc
 .DS_Store
 Thumbs.db
+
+# web installer site assembled by tools/build_site.py
+_site/

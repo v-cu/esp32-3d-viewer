@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>esp32-3d-viewer — installer and model studio</title>
+<meta name="description" content="Install the esp32-3d-viewer firmware on a Waveshare ESP32-S3-Touch-AMOLED-1.8 from the browser and convert your own .glb / .obj models for it.">
+<link rel="icon" href="img/icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+<script type="importmap">
+{ "imports": {
+    "three": "./vendor/three/three.module.js",
+    "three/addons/": "./vendor/three/addons/"
+} }
+</script>
+<script type="module" src="js/main.js"></script>
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="#top">esp32-3d-viewer</a>
+  <nav>
+    <a href="#install">Install</a>
+    <a href="#studio">Model studio</a>
+    <a href="https://github.com/v-cu/esp32-3d-viewer">GitHub</a>
+  </nav>
+</header>
+
+<main id="top">
+  <section class="hero">
+    <div class="hero-text">
+      <h1>Studio-lit 3D models on a 1.8&Prime; AMOLED</h1>
+      <p class="lede">Firmware for the Waveshare ESP32-S3-Touch-AMOLED-1.8 (V2). It renders cars and any
+        other 3D model in real time; you turn them with a finger or by tilting the board.</p>
+      <p class="lede">Install it from this page, then turn your own <code>.glb</code> or <code>.obj</code>
+        files into models for the board. Nothing is uploaded: the conversion runs in your browser.</p>
+      <div class="actions">
+        <a class="btn primary" href="#install">Install the firmware</a>
+        <a class="btn" href="#studio">Convert a model</a>
+      </div>
+    </div>
+    <figure class="device">
+      <div class="slab">
+        <div class="screen" id="hero-screen"></div>
+      </div>
+      <figcaption>
+        <span id="hero-caption">Live preview, drawn the same way the board draws it. Drag to turn.</span>
+        <span class="chips" id="hero-chips"></span>
+      </figcaption>
+    </figure>
+  </section>
+
+  <div class="notice" id="browser-notice" hidden>
+    Installing needs Web Serial, which only Chrome and Edge on a computer have. You can still convert
+    models here and download them.
+  </div>
+
+  <section class="block" id="install">
+    <h2>Install the firmware</h2>
+    <p class="sub" id="fw-info">Checking for the latest build…</p>
+    <ol class="steps">
+      <li>
+        <h3>Connect the board</h3>
+        <p>Plug it in with a USB-C data cable. A blank board is ready right away. If the board does not
+          answer, hold <kbd>BOOT</kbd>, tap <kbd>RESET</kbd>, release <kbd>BOOT</kbd> and try again. A board
+          that is asleep wakes up with a press of <kbd>BOOT</kbd>.</p>
+      </li>
+      <li>
+        <h3>Choose what to write</h3>
+        <label class="check"><input type="checkbox" id="opt-models" checked><span>Demo models (Ferrari, Fox, Duck)</span></label>
+        <label class="check"><input type="checkbox" id="opt-erase"><span>Erase the whole flash first <span class="hint">(also resets the saved settings)</span></span></label>
+        <p class="hint">Your own models can be written later from the model studio without reinstalling.</p>
+      </li>
+      <li>
+        <h3>Install</h3>
+        <button class="btn primary" id="btn-install" disabled>Connect and install</button>
+        <div class="progress" id="install-progress" hidden><div class="fill"></div><span class="label"></span></div>
+        <p class="status" id="install-status" role="status"></p>
+      </li>
+    </ol>
+    <details class="log"><summary>Flasher log</summary><pre id="install-log"></pre></details>
+  </section>
+
+  <section class="block" id="studio">
+    <h2>Model studio</h2>
+    <p class="sub">Drop 3D models here. Each one is converted for the board: hidden parts removed, simplified
+      to a triangle budget, materials detected and lit. The list order is the order of the triple-tap cycle.</p>
+
+    <div class="studio">
+      <div class="col-list">
+        <label class="drop" id="drop">
+          <input type="file" id="file-input" multiple accept=".glb,.gltf,.obj,.mtl,.bin,.png,.jpg,.jpeg,.webp">
+          <strong>Drop .glb, .gltf or .obj files</strong>
+          <span>or click to choose. For .gltf and .obj, select the model together with its .bin, .mtl and
+            texture files. Converted <code>.bin</code> models and packs can be added too.</span>
+        </label>
+        <div class="list-head">
+          <span id="pack-count">No models yet</span>
+          <button class="link" id="btn-demo">Add the demo models</button>
+        </div>
+        <ol class="models" id="models"></ol>
+        <div class="meter" id="meter" title="Space used in the model partition">
+          <div class="meter-bar"><div class="meter-fill" id="meter-fill"></div></div>
+          <span id="meter-text">0 of 12.9 MB</span>
+        </div>
+        <div class="pack-actions">
+          <button class="btn primary" id="btn-flash-models" disabled>Write models to the board</button>
+          <button class="btn" id="btn-download-pack" disabled>Download pack</button>
+        </div>
+        <div class="progress" id="models-progress" hidden><div class="fill"></div><span class="label"></span></div>
+        <p class="status" id="models-status" role="status"></p>
+      </div>
+
+      <div class="col-preview">
+        <div class="slab wide"><div class="screen" id="studio-screen">
+          <p class="empty" id="studio-empty">The converted model appears here.</p>
+        </div></div>
+        <div class="detail" id="detail" hidden>
+          <div class="detail-head">
+            <input class="name" id="d-name" maxlength="23" aria-label="Model name" spellcheck="false">
+            <button class="btn small" id="d-download">Download .bin</button>
+          </div>
+          <p class="stats" id="d-stats"></p>
+          <ul class="mats" id="d-mats"></ul>
+          <details class="settings" id="d-settings">
+            <summary>Conversion settings</summary>
+            <div class="grid">
+              <label>Triangles
+                <span class="range"><input type="range" id="s-budget" min="2000" max="20000" step="500" value="10000"><output id="s-budget-out">10 000</output></span>
+              </label>
+              <label>Front of the model
+                <select id="s-yaw">
+                  <option value="">Automatic</option>
+                  <option value="flip">Turned around</option>
+                  <option value="90">Turned 90° left</option>
+                  <option value="-90">Turned 90° right</option>
+                </select>
+              </label>
+              <label>Up axis
+                <select id="s-up">
+                  <option value="y">Y (glTF, most files)</option>
+                  <option value="z">Z (CAD, Blender exports)</option>
+                  <option value="-z">−Z</option>
+                  <option value="x">X</option>
+                </select>
+              </label>
+              <label>Kind
+                <select id="s-kind">
+                  <option value="auto">Detect</option>
+                  <option value="car">Car</option>
+                  <option value="object">Object</option>
+                </select>
+              </label>
+              <label>Colours from texture
+                <span class="range"><input type="range" id="s-tex" min="0" max="16" step="1" value="12"><output id="s-tex-out">12</output></span>
+              </label>
+              <label>Body colour (cars)
+                <span class="paint"><input type="checkbox" id="s-paint-on" aria-label="Override the body colour"><input type="color" id="s-paint" value="#b3141e"></span>
+              </label>
+              <label class="check wide"><input type="checkbox" id="s-hidden"><span>Keep hidden geometry (for example a convertible without glass)</span></label>
+            </div>
+            <button class="btn" id="d-reconvert">Convert again</button>
+          </details>
+          <details class="log"><summary>Converter log</summary><pre id="d-log"></pre></details>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <p>Made for the <a href="https://docs.waveshare.com/ESP32-S3-Touch-AMOLED-1.8">Waveshare ESP32-S3-Touch-AMOLED-1.8</a> V2.
+    Source code on <a href="https://github.com/v-cu/esp32-3d-viewer">GitHub</a> (MIT).
+    A desk stand to print: <a href="https://makerworld.com/models/3483955-desk-stand-for-esp32-s3-amoled-1-8-3d-model-viewer#profileId-3978230">MakerWorld</a>.</p>
+  <p>Demo models: Ferrari 458 Italia by vicent091036; Duck and Fox from the Khronos glTF Sample Models.
+    Built with three.js, meshoptimizer and esptool-js.</p>
+</footer>
+</body>
+</html>

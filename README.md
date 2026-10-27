@@ -13,6 +13,10 @@ your finger or by tilting the board, switch between models with a triple tap.
   <sub>Touch rotation with inertia, triple tap to switch models (Ferrari → Fox → Duck), settings screen. Video at 1.5× speed.</sub>
 </p>
 
+**Install it from the browser, no toolchain needed:**
+👉 **[v-cu.github.io/esp32-3d-viewer](https://v-cu.github.io/esp32-3d-viewer/)** — firmware installer
+and model studio (drop a `.glb` / `.obj`, get a model for the board). Chrome or Edge on a computer.
+
 ## Features
 
 - **~30 FPS** with a 10 000-triangle model at 448×368, both CPU cores rendering
@@ -42,6 +46,20 @@ your finger or by tilting the board, switch between models with a triple tap.
 > printed on the label on the back of the board.
 
 ## Quick start
+
+### From the browser
+
+1. Open the [web installer](https://v-cu.github.io/esp32-3d-viewer/) in Chrome or Edge (desktop).
+2. Connect the board with a USB-C data cable and click **Connect and install**.
+3. Optional: in the **Model studio** drop your own `.glb`, `.gltf` or `.obj` files, arrange
+   them and click **Write models to the board**. Only the model partition is written; the
+   firmware and the settings stay.
+
+The conversion runs entirely in the browser (JavaScript port of `tools/model_convert.py`);
+no file leaves your computer. If the board does not answer, hold **BOOT**, tap **RESET**,
+release **BOOT** and try again.
+
+### With ESP-IDF
 
 Requirements: [ESP-IDF 5.5.x](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/get-started/)
 (tested with v5.5.1). LVGL 9.2 is downloaded automatically by the component manager.
@@ -89,6 +107,11 @@ The repository ships a pack with three demo models:
 
 Single converted models are in `firmware/models/src/`, the pack that gets flashed is
 `firmware/models/model.bin`.
+
+The easiest way is the **Model studio** of the [web installer](https://v-cu.github.io/esp32-3d-viewer/):
+drop the files, adjust the triangle budget / body colour / front direction if needed,
+reorder, then download the pack or write it straight to the board. The command line tools
+below do the same.
 
 ### 1. Install the converter dependencies (once)
 
@@ -221,9 +244,28 @@ tools/
   pack_models.py         several models -> one pack
   flash_model.py         flash only the models
   preview.py             GIF from simulator frames
+  build_site.py          assembles the GitHub Pages site (installer + model studio)
+web/                     the site: installer (esptool-js), browser converter (three.js, meshoptimizer)
 sim/                     PC simulator (CMake)
 docs/                    photo and demo GIF used by this README
+.github/workflows/       builds the firmware and publishes the site on every push to main
 ```
+
+## Web installer (GitHub Pages)
+
+`.github/workflows/pages.yml` builds the firmware with ESP-IDF 5.5.1 on every push to `main`
+and publishes `web/` together with the binaries and the demo models. To enable it in a fork:
+**Settings → Pages → Build and deployment → Source: GitHub Actions**, then push (or run the
+workflow by hand under **Actions**).
+
+To try the site locally after `idf.py build`:
+
+```bash
+python tools/build_site.py            # writes _site/
+python -m http.server -d _site 8000   # open http://localhost:8000 in Chrome
+```
+
+Web Serial only works on `https://` pages and on `localhost`.
 
 ## Troubleshooting
 
@@ -234,6 +276,8 @@ docs/                    photo and demo GIF used by this README
 | model turns the wrong way in Motion mode | enable *Motion: invert left/right* |
 | log says `I2C bus stuck low` | power the board off completely (USB **and** battery, or hold PWR ~10 s) |
 | a model is too slow | convert it with `--budget 7000`, or turn off *Smooth edges* |
+| web installer: no port in the list | use a data cable (not charge-only); on Windows check the Device Manager for "USB JTAG/serial debug unit" |
+| web installer: "did not answer" | hold BOOT, tap RESET, release BOOT, then connect again; a sleeping board must be woken up first |
 
 ## 3D-printed desk stand
 
@@ -250,7 +294,9 @@ Demo models, converted to the R3DM format (the original licences apply):
   (Duck © Sony Computer Entertainment Inc., SCEA Shared Source License; Fox model by
   PixelMannen, rigging by tomkranis, CC BY 4.0)
 
-Built with [ESP-IDF](https://github.com/espressif/esp-idf) and [LVGL](https://lvgl.io).
+Built with [ESP-IDF](https://github.com/espressif/esp-idf) and [LVGL](https://lvgl.io). The web
+installer uses [three.js](https://threejs.org), [meshoptimizer](https://github.com/zeux/meshoptimizer)
+and [esptool-js](https://github.com/espressif/esptool-js) (copies with their licences in `web/vendor/`).
 
 ## License
 
