@@ -15,6 +15,7 @@ Test locally:  python -m http.server -d _site 8000   ->  http://localhost:8000
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -66,6 +67,32 @@ def split_pack(data):
         off, size, name = struct.unpack_from("<II24s", data, 8 + 32 * i)
         out.append((name.split(b"\0")[0].decode("utf-8", "replace"), data[off:off + size]))
     return out
+
+
+def bust_cache(out):
+    """Append ?v=<content hash> to every relative .js / .css reference, so browsers load the
+    new scripts (also the converter worker and its imports) right after a deploy instead of
+    a cached copy (GitHub Pages lets browsers cache files for 10 minutes)."""
+    h = hashlib.sha1()
+    for root, _, files in sorted(os.walk(os.path.join(ROOT, "web"))):
+        for fn in sorted(files):
+            h.update(open(os.path.join(root, fn), "rb").read())
+    v = h.hexdigest()[:10]
+    ref = re.compile(r"""(['"])((?:\.{1,2}/|js/|css/)[^'"?]+?\.(?:js|css))\1""")
+    n = 0
+    for root, _, files in os.walk(out):
+        for fn in files:
+            if not (fn.endswith(".js") or fn == "index.html"):
+                continue
+            if os.sep + "vendor" + os.sep in os.path.join(root, fn) + os.sep and fn != "index.html":
+                continue
+            path = os.path.join(root, fn)
+            txt = open(path, encoding="utf-8").read()
+            new, k = ref.subn(lambda m: f"{m.group(1)}{m.group(2)}?v={v}{m.group(1)}", txt)
+            if k:
+                open(path, "w", encoding="utf-8").write(new)
+                n += k
+    print(f"cache busting: {n} references -> ?v={v}")
 
 
 def main():
@@ -121,6 +148,7 @@ def main():
             parts.append({"name": label, "file": "firmware/" + dst, "offset": offs[key], "size": os.path.getsize(src)})
         manifest["parts"] = parts
     json.dump(manifest, open(os.path.join(fw_dir, "manifest.json"), "w"), indent=1)
+    bust_cache(a.out)
     print(f"site written to {a.out}: {len(models)} demo models, firmware {'yes' if not a.no_firmware else 'no'}"
           f" ({a.version or 'no version'})")
 

@@ -67,7 +67,7 @@ CLS_IMPORTANCE = {CLS_PAINT: 2.6, CLS_GLASS: 1.1, CLS_CHROME: 1.0, CLS_METAL: 0.
 CLS_MATCAP = {CLS_PAINT: 128, CLS_GLASS: 128, CLS_CHROME: 128}
 
 # classes whose texture brightness detail is kept per vertex
-TEX_DETAIL_CLS = (CLS_GENERIC, CLS_PLASTIC, CLS_INTERIOR, CLS_PAINT)
+TEX_DETAIL_CLS = (CLS_GENERIC, CLS_PLASTIC, CLS_INTERIOR, CLS_PAINT, CLS_LIGHT_RED, CLS_LIGHT_CLEAR)
 
 MAGIC = b"R3DM"
 VERSION = 2
@@ -366,6 +366,16 @@ def lamps_by_position(parts):
             lamp = np.array([_is_red(c) or _is_reddish(c) for c in col])
         if not lamp.any():
             out.append(p)
+            continue
+        # textured lamp: the whole part becomes a lamp, the texture split ('light' mode) then
+        # sorts its colour regions (red lens, reverse light, black housing, amber indicator)
+        if p.get("fcol") is not None and lamp.sum() >= 0.2 * len(F):
+            q = dict(p); q["cls"] = CLS_LIGHT_CLEAR if front else CLS_LIGHT_RED
+            out.append(q)
+            if front:
+                nf_ += len(F)
+            else:
+                nr_ += len(F)
             continue
         masks = [(np.ones(len(F), bool), True)] if lamp.sum() >= 0.5 * len(F) else [(lamp, True), (~lamp, False)]
         for m, is_lamp in masks:
@@ -1018,7 +1028,7 @@ def rot_y(deg):
     return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
 
 
-def lamp_front_sign(parts, R):
+def lamp_front_sign(parts, R, x0=0.0):
     """+1 if the front of the car (white lamps) is at +x, -1 if at -x, None if unknown.
     Uses the real lamp colours (texture or material) of light/glass parts: strongly red
     surfaces are tail lights, bright neutral surfaces are headlights."""
@@ -1030,6 +1040,7 @@ def lamp_front_sign(parts, R):
         if p["cls"] not in (CLS_LIGHT_RED, CLS_LIGHT_CLEAR, CLS_GLASS) and not atlas:
             continue
         V = p["mesh"].vertices @ R.T
+        V[:, 0] -= x0                   # relative to the middle of the model
         F = np.asarray(p["mesh"].faces)
         cx = V[F].mean(1)[:, 0]
         area = np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1)
@@ -1118,7 +1129,8 @@ def normalise_orientation(parts, cfg):
     if "yaw_deg" in cfg:
         R = rot_y(float(cfg["yaw_deg"])) @ R
     elif is_car:
-        side = lamp_front_sign(parts, R)
+        Vr = np.concatenate([p["mesh"].vertices for p in parts if p["cls"] != CLS_DROP]) @ R.T
+        side = lamp_front_sign(parts, R, float(Vr[:, 0].min() + Vr[:, 0].max()) / 2)
         if side is None:                   # fallback: headlight vs taillight parts by class
             cx = lambda cls: [p["mesh"].vertices @ R.T for p in parts if p["cls"] == cls]
             fr, rr = cx(CLS_LIGHT_CLEAR), cx(CLS_LIGHT_RED)
@@ -1174,9 +1186,12 @@ def convert(args):
     parts = [p for p in parts if p["cls"] != CLS_DROP]
     log(f"  mode: {'car' if cfg['_is_car'] else 'object'}")
     parts = drop_overlay_shells(parts)
+    if cfg["_is_car"]:
+        for p in parts:
+            part_face_colors(p)
+        parts = lamps_by_position(parts)
     parts = apply_texture_split(parts, cfg["_is_car"], args.tex_colors)
     if cfg["_is_car"]:
-        parts = lamps_by_position(parts)
         parts = drop_lamp_covers(parts)
     ndup = 0
     for p in parts:
@@ -1421,6 +1436,8 @@ def convert(args):
 
     paint_lin = parse_color(args.paint) if args.paint else (parse_color(cfg["paint"]) if "paint" in cfg else None)
 
+    y_all = np.concatenate([p["V"][:, 1] for p in out_parts])
+    y_mid = float(y_all.min() + y_all.max()) / 2
     allV, allN, allF, mats, details = [], [], [], [], []
     lod1_parts = []
     voff, toff = 0, 0
@@ -1431,6 +1448,11 @@ def convert(args):
         crease = args.crease if cls != CLS_TIRE else 60
         Vn, Nn, Fn = crease_normals(Vg, Fg, crease)
         Nn, _ = transfer_normals(Vn, Nn, hi_tree, hiN)
+        if cls == CLS_GLASS:
+            # windows are thin sheets (double sided or two layers): normals can end up pointing
+            # into the car (dark AO, wrong reflection). Glass is outside: point them outwards.
+            rel = Vn - np.array([0.0, y_mid, 0.0])
+            Nn = np.where((np.sum(rel * Nn, axis=1) < 0)[:, None], -Nn, Nn)
         if args.reflection_lod > 0 and meshopt is not None and len(Fg) > 8:
             F1g = meshopt_simplify(Vg, Fg, max(4, int(len(Fg) * args.reflection_lod)))
             u1 = np.unique(F1g)

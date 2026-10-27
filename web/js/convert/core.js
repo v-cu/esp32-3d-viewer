@@ -18,7 +18,7 @@ const CLS_IMPORTANCE = {
   [CLS.PLASTIC]: 0.55, [CLS.LIGHT_RED]: 1.1, [CLS.LIGHT_CLEAR]: 1.2, [CLS.INTERIOR]: 0.3,
   [CLS.CARBON]: 0.8, [CLS.GENERIC]: 0.9,
 };
-const TEX_DETAIL_CLS = [CLS.GENERIC, CLS.PLASTIC, CLS.INTERIOR, CLS.PAINT];
+const TEX_DETAIL_CLS = [CLS.GENERIC, CLS.PLASTIC, CLS.INTERIOR, CLS.PAINT, CLS.LIGHT_RED, CLS.LIGHT_CLEAR];
 
 // linear per-vertex colour from per-face sRGB colours (area weighted)
 function vertexColors(p) {
@@ -469,6 +469,13 @@ function lampsByPosition(parts, log) {
       if (ok) { lamp[f] = 1; n++; }
     }
     if (!n) { out.push(p); continue; }
+    // textured lamp: the whole part becomes a lamp, the texture split ('light' mode) then
+    // sorts its colour regions (red lens, reverse light, black housing, amber indicator)
+    if (p.faceCol && n >= 0.2 * nf) {
+      out.push({ ...p, cls: front ? CLS.LIGHT_CLEAR : CLS.LIGHT_RED });
+      if (front) nFront += nf; else nRear += nf;
+      continue;
+    }
     // the whole part when most of it qualifies (no ragged split), else only those faces
     const whole = n >= 0.5 * nf;
     const pieces = whole ? [[null, true]] : [[lamp, true], [lamp.map((v) => 1 - v), false]];
@@ -545,7 +552,7 @@ function applyR(V, R) {
   return out;
 }
 
-function lampFrontSign(parts, R) {
+function lampFrontSign(parts, R, x0 = 0) {   // x0: middle of the model along x in the R frame
   const xr = [], wr = [], xw = [], ww = [];
   let any = false;
   for (const p of parts) {
@@ -554,6 +561,7 @@ function lampFrontSign(parts, R) {
     if (![CLS.LIGHT_RED, CLS.LIGHT_CLEAR, CLS.GLASS].includes(p.cls) && !atlas) continue;
     any = true;
     const V = applyR(p.V0, R), F = p.F, nf = F.length / 3;
+    for (let i = 0; i < V.length; i += 3) V[i] -= x0;
     const area = faceAreas(V, F, false);
     let maxAbsX = 0;
     for (let i = 0; i < V.length; i += 3) maxAbsX = Math.max(maxAbsX, Math.abs(V[i]));
@@ -641,7 +649,8 @@ function normaliseOrientation(parts, cfg) {
   else if (ext[2] > ext[0]) R = matMul(rotY(-90), R);
   if (cfg.yaw_deg !== undefined && cfg.yaw_deg !== null && cfg.yaw_deg !== '') R = matMul(rotY(Number(cfg.yaw_deg)), R);
   else if (isCar) {
-    let side = lampFrontSign(parts, R);
+    const [b0, b1] = bounds(R);
+    let side = lampFrontSign(parts, R, (b0[0] + b1[0]) / 2);
     if (side === null) {
       const meanX = (cls) => {
         let s = 0, n = 0;
@@ -761,6 +770,13 @@ function transferNormals(V, N, grid, hiN, maxAngleDeg = 28) {
   return out;
 }
 
+function outwardNormals(V, N, yMid) {
+  for (let i = 0; i < V.length; i += 3) {
+    const d = V[i] * N[i] + (V[i + 1] - yMid) * N[i + 1] + V[i + 2] * N[i + 2];
+    if (d < 0) { N[i] = -N[i]; N[i + 1] = -N[i + 1]; N[i + 2] = -N[i + 2]; }
+  }
+}
+
 function parseColor(s) {
   s = String(s).trim().replace(/^#/, '');
   return srgbToLin([0, 2, 4].map((i) => parseInt(s.slice(i, i + 2), 16) / 255));
@@ -825,11 +841,9 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   parts = parts.filter((p) => p.cls !== CLS_DROP);
   log(`  mode: ${cfg._isCar ? 'car' : 'object'}`);
   parts = dropOverlayShells(parts, log);
+  if (cfg._isCar) parts = lampsByPosition(parts, log);
   parts = applyTextureSplit(parts, cfg._isCar, texColors, log);
-  if (cfg._isCar) {
-    parts = lampsByPosition(parts, log);
-    parts = dropLampCovers(parts, log);
-  }
+  if (cfg._isCar) parts = dropLampCovers(parts, log);
   let ndup = 0;
   for (const p of parts) {
     const vc = p.faceCol && p.texDetail ? vertexColors(p) : null;
@@ -1056,6 +1070,15 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   if (opts.paint) paintLin = parseColor(opts.paint);
   else if (cfg.paint) paintLin = parseColor(cfg.paint);
 
+  // windows are thin sheets, often double sided or modelled as two layers: their normals can
+  // end up pointing into the car (dark AO, wrong reflection). Glass lies on the outside, so
+  // its normals are turned to point away from the middle of the model.
+  let yMid = 0;
+  {
+    let y0 = Infinity, y1 = -Infinity;
+    for (const p of outParts) for (let i = 1; i < p.V.length; i += 3) { y0 = Math.min(y0, p.V[i]); y1 = Math.max(y1, p.V[i]); }
+    yMid = (y0 + y1) / 2;
+  }
   const allV = [], allN = [], allF = [], mats = [], details = [];
   let vo = 0, to = 0;
   for (const { cls, list } of groups.values()) {
@@ -1063,6 +1086,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     const cr = cls !== CLS.TIRE ? crease : 60;
     const cn = creaseNormals(j.V, j.F, cr);
     const Nn = transferNormals(cn.V, cn.N, hiGrid, hiN);
+    if (cls === CLS.GLASS) outwardNormals(cn.V, Nn, yMid);
     const a = list.map((p) => faceAreas(p.V, p.F, false).reduce((s, v) => s + v, 0));
     const aw = a.map((v) => v + 1e-12), asum = aw.reduce((s, v) => s + v, 0);
     let color = [0, 1, 2].map((c) => list.reduce((s, p, i) => s + p.mat.color[c] * aw[i], 0) / asum);
