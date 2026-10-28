@@ -199,7 +199,7 @@ export function renderMatcap(cls, color, size, roughHint = 0.5, opts = {}) {
       break;
     }
     case CLS.GLASS: {
-      E1 = blur(0.02);
+      E1 = blur(0.035);                               // a touch softer: no stair steps on flat glass
       const tint = [0.010, 0.012, 0.016];
       for (let k = 0; k < N; k++) {
         const f = fres(0.04, k);

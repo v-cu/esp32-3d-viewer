@@ -360,9 +360,10 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
     if (p.faceCol) {
       if (!isCar) mode = 'object';
       else if (p.cls === CLS.LIGHT_RED || p.cls === CLS.LIGHT_CLEAR) mode = 'light';
-      else if (p.cls === CLS.PAINT && (p.paintByName || p === biggestPaint))
+      else if (p.cls === CLS.PAINT && (p.paintByName || (biggestPaint && p.mat.name === biggestPaint.mat.name)))
         mode = isAtlas(p, 300) ? 'paint' : null;                            // livery
-      else if (p.cls === CLS.METAL && WHEEL_RX.test((p.mat.name + ' ' + p.name).toLowerCase()))
+      else if ((p.cls === CLS.METAL && WHEEL_RX.test((p.mat.name + ' ' + p.name).toLowerCase()))
+        || (p.wheelGeom && [CLS.METAL, CLS.GENERIC, CLS.PLASTIC].includes(p.cls)))
         mode = isAtlas(p, 300) ? 'wheel' : null;                             // rim + tyre in one texture
       else if ([CLS.GENERIC, CLS.PLASTIC, CLS.PAINT, CLS.INTERIOR].includes(p.cls)) mode = isAtlas(p) ? 'atlas' : null;
     }
@@ -442,6 +443,18 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
       });
     });
     log(`  '${p.name.slice(0, 40)}' (${mode}): ${colors.length} colour regions -> ${summary.join(' ')}`);
+  }
+  // livery over several parts of one material: the body colour is the colour with the
+  // largest area over all of them
+  const bySrc = new Map();
+  for (const q of out) if (q.paintSrc) { if (!bySrc.has(q.paintSrc)) bySrc.set(q.paintSrc, []); bySrc.get(q.paintSrc).push(q); }
+  for (const list of bySrc.values()) {
+    const ck = (q) => linToSrgb(q.mat.color).map((v) => Math.round(v * 6)).join(',');
+    const area = new Map();
+    for (const q of list) area.set(ck(q), (area.get(ck(q)) || 0) + faceAreas(q.V, q.F).reduce((a, b) => a + b, 0));
+    let best = null, ba = -1;
+    for (const [k, a] of area) if (a > ba) { ba = a; best = k; }
+    for (const q of list) q.paintKey = ck(q) === best ? 'main' : `l${ck(q)}`;
   }
   return out;
 }
@@ -611,9 +624,14 @@ function applyR(V, R) {
   return out;
 }
 
+let lampStats = null;
 function lampFrontSign(parts, R, x0 = 0) {   // x0: middle of the model along x in the R frame
   const xr = [], wr = [], xw = [], ww = [];
-  let any = false;
+  let any = false, totalArea = 0;
+  for (const p of parts) {
+    if (p.cls === CLS_DROP) continue;
+    totalArea += faceAreas(applyR(p.V0, R), p.F, false).reduce((x, y) => x + y, 0);
+  }
   for (const p of parts) {
     if (p.cls === CLS_DROP) continue;
     const atlas = [CLS.GENERIC, CLS.PLASTIC, CLS.PAINT].includes(p.cls);
@@ -640,7 +658,10 @@ function lampFrontSign(parts, R, x0 = 0) {   // x0: middle of the model along x 
   if (!any) return null;
   const sum = (a) => a.reduce((s, v) => s + v, 0);
   const avg = (x, w) => { let s = 0, t = 0; for (let i = 0; i < x.length; i++) { s += x[i] * w[i]; t += w[i]; } return s / t; };
-  if (sum(wr) <= 0) return null;
+  lampStats = { red: sum(wr), white: sum(ww), mr: sum(wr) > 0 ? avg(xr, wr) : null, mw: sum(ww) > 0 ? avg(xw, ww) : null };
+  // a few stray red triangles are no evidence (relative to the whole model surface)
+  if (sum(wr) <= 3e-4 * totalArea) return null;
+  if (sum(ww) <= 3e-4 * totalArea) { ww.length = 0; xw.length = 0; }
   const mr = avg(xr, wr);
   if (sum(ww) <= 0) {
     let span = 1e-9;
@@ -682,7 +703,13 @@ function normaliseOrientation(parts, cfg) {
     for (const p of parts) {
       if (p.cls === CLS_DROP) continue;
       const [a, b] = bounds(R, p);
+      const e = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], emax = Math.max(...e), emin = Math.min(...e);
+      const flat = emin <= 0.02 * emax;
+      const nm = (p.name + ' ' + p.mat.name).toLowerCase();
       if (b[1] - a[1] <= 0.02 * H && b[1] <= mn[1] + 0.03 * H && (b[0] - a[0]) * (b[2] - a[2]) >= 0.25 * A) ground.push(p);
+      // shadow planes (any orientation) and big flat card / backdrop quads
+      else if (flat && /shadow|sombra|schatten/.test(nm)) ground.push(p);
+      else if (flat && p.F.length / 3 <= 12 && emax > 0.5 * Math.max(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2])) ground.push(p);
     }
     if (ground.length && ground.length < parts.filter((p) => p.cls !== CLS_DROP).length) {
       const saved = ground.map((p) => p.cls);
@@ -690,7 +717,7 @@ function normaliseOrientation(parts, cfg) {
       const [m2, x2] = bounds(R);
       const L2 = Math.max(x2[0] - m2[0], x2[2] - m2[2]);
       if (x2[1] - m2[1] >= 0.05 * L2) {
-        cfg._log?.(`  removed ground plane: ${ground.map((p) => p.name).join(', ')}`);
+        cfg._log?.(`  removed ground / shadow planes: ${ground.map((p) => p.name).join(', ')}`);
         [mn, mx] = [m2, x2];
       } else ground.forEach((p, i) => { p.cls = saved[i]; });      // the plane is the model
     }
@@ -714,14 +741,15 @@ function normaliseOrientation(parts, cfg) {
       const c = alongX ? (a[0] + b[0]) / 2 - (mn[0] + mx[0]) / 2 : (a[2] + b[2]) / 2 - (mn[2] + mx[2]) / 2;
       if (Math.abs(c) < 0.25 * Lh) continue;
       wheels++; ends.add(c > 0);
+      p.wheelGeom = true;
     }
     if (ends.size < 2) wheels = 0;
   }
   const isCar = kind === 'car' || (kind === 'auto' && (live.some((p) => [CLS.TIRE, CLS.LIGHT_RED, CLS.LIGHT_CLEAR].includes(p.cls))
     || (carShape && (wheels >= 3 || live.some((p) => p.cls === CLS.PAINT)))));
   cfg._isCar = isCar;
-  if (!isCar) R = matMul(rotY(90), R);
-  else if (ext[2] > ext[0]) R = matMul(rotY(-90), R);
+  // glTF convention: the front faces +Z -> becomes +X (lamps or part names may turn it later)
+  if (!isCar || ext[2] > ext[0]) R = matMul(rotY(90), R);
   if (cfg.yaw_deg !== undefined && cfg.yaw_deg !== null && cfg.yaw_deg !== '') R = matMul(rotY(Number(cfg.yaw_deg)), R);
   else if (isCar) {
     const [b0, b1] = bounds(R);
@@ -738,7 +766,29 @@ function normaliseOrientation(parts, cfg) {
       const fr = meanX(CLS.LIGHT_CLEAR), rr = meanX(CLS.LIGHT_RED);
       if (fr !== null && rr !== null) side = fr > rr ? 1 : -1;
     }
+    if (side === null) {
+      // part names: "front", "rear", wheel_FL / WheelBR ...
+      const FRONT = /front|frnt|(?<![a-z])f[lr](?![a-z])|wheel_?f[lr]|f[lr]_?wheel/;
+      const REAR = /rear|back|(?<![a-z])[rb][lr](?![a-z])|wheel_?[rb][lr]|[rb][lr]_?wheel/;
+      let sf = 0, nf2 = 0, sr = 0, nr = 0;
+      for (const p of parts) {
+        if (p.cls === CLS_DROP) continue;
+        const nm = p.name.toLowerCase(), isF = FRONT.test(nm), isR = REAR.test(nm);
+        if (isF === isR) continue;
+        const V = applyR(p.V0, R);
+        let sx = 0;
+        for (let i = 0; i < V.length; i += 3) sx += V[i];
+        sx /= V.length / 3;
+        if (isF) { sf += sx; nf2++; } else { sr += sx; nr++; }
+      }
+      if (nf2 && nr && Math.abs(sf / nf2 - sr / nr) > 1e-6) {
+        side = sf / nf2 > sr / nr ? 1 : -1;
+        cfg._log?.('  front: from part names (front / rear)');
+      }
+    }
     if (side !== null && side < 0) R = matMul(rotY(180), R);
+    const ls = lampStats || {};
+    cfg._log?.(`  front: ${side === null ? 'unknown' : side > 0 ? 'as modelled' : 'turned around'} (red ${(ls.red || 0).toFixed(3)} @ ${ls.mr?.toFixed(2)}, white ${(ls.white || 0).toFixed(3)} @ ${ls.mw?.toFixed(2)})`);
   }
   if (cfg.flip_front) R = matMul(rotY(180), R);
   [mn, mx] = bounds(R);
@@ -920,6 +970,30 @@ function outwardNormals(V, N, yMid) {
   }
 }
 
+// Normal of a smooth surface patch around each vertex: area weighted normals of the original
+// faces within NORMAL_FILTER_R that face the same way (< 50 deg). Panel gaps, rivets and other
+// detail the simplified mesh can not show no longer bend the vertex normals, so doors and
+// bonnets reflect evenly instead of showing smears and dents.
+const NORMAL_FILTER_R = 0.012;
+function filteredNormals(V, N, hf) {
+  const n = V.length / 3, out = new Float64Array(N.length), cosT = Math.cos(50 * Math.PI / 180);
+  for (let i = 0; i < n; i++) {
+    const nx = N[3 * i], ny = N[3 * i + 1], nz = N[3 * i + 2];
+    let ax = 0, ay = 0, az = 0, cnt = 0;
+    hf.grid.within(V[3 * i], V[3 * i + 1], V[3 * i + 2], NORMAL_FILTER_R, (f) => {
+      const fx = hf.N[3 * f], fy = hf.N[3 * f + 1], fz = hf.N[3 * f + 2];
+      if (fx * nx + fy * ny + fz * nz < cosT) return;
+      const w = hf.A[f];
+      ax += fx * w; ay += fy * w; az += fz * w; cnt++;
+    });
+    const l = Math.sqrt(ax * ax + ay * ay + az * az);
+    // a coarse original (few big faces around): its own smooth vertex normal is better
+    if (l > 1e-12 && cnt >= 8) { out[3 * i] = ax / l; out[3 * i + 1] = ay / l; out[3 * i + 2] = az / l; }
+    else { out[3 * i] = nx; out[3 * i + 1] = ny; out[3 * i + 2] = nz; }
+  }
+  return out;
+}
+
 function parseColor(s) {
   s = String(s).trim().replace(/^#/, '');
   return srgbToLin([0, 2, 4].map((i) => parseInt(s.slice(i, i + 2), 16) / 255));
@@ -966,6 +1040,11 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     faceCol: p.faceCol || null, texDetail: !!p.faceCol,
   }));
   if (!parts.length) throw new Error('No triangle meshes found in the file');
+  // fully transparent materials (alpha 0: hidden helpers, texture blend cards) are invisible
+  const nInv = parts.length;
+  parts = parts.filter((p) => !(p.mat.alpha < 0.03));
+  if (!parts.length) throw new Error('No visible triangle meshes found in the file');
+  if (parts.length < nInv) log(`  skipped ${nInv - parts.length} invisible parts (alpha 0)`);
   log(`  ${parts.length} parts, ${parts.reduce((s, p) => s + p.F.length / 3, 0)} triangles`);
   progress('Classifying materials', 0);
 
@@ -1067,6 +1146,20 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     hiN[i] /= l; hiN[i + 1] /= l; hiN[i + 2] /= l;
   }
   const hiGrid = new PointGrid(V, 1e-4);
+  // high resolution face centroids / unit normals / areas for the filtered normals below
+  const hiFace = (() => {
+    const n = F.length / 3, C = new Float64Array(n * 3), Nf = new Float32Array(n * 3), A = new Float32Array(n);
+    for (let f = 0; f < n; f++) {
+      const a = 3 * F[3 * f], b = 3 * F[3 * f + 1], c = 3 * F[3 * f + 2];
+      const ux = V[b] - V[a], uy = V[b + 1] - V[a + 1], uz = V[b + 2] - V[a + 2];
+      const vx = V[c] - V[a], vy = V[c + 1] - V[a + 1], vz = V[c + 2] - V[a + 2];
+      const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1e-20;
+      Nf[3 * f] = nx / l; Nf[3 * f + 1] = ny / l; Nf[3 * f + 2] = nz / l; A[f] = l;
+      for (let k = 0; k < 3; k++) C[3 * f + k] = (V[a + k] + V[b + k] + V[c + k]) / 3;
+    }
+    return { C, N: Nf, A, grid: new PointGrid(C, NORMAL_FILTER_R) };
+  })();
 
   const areas = faceAreas(V, F);
   // ---- car paint: the biggest visible saturated surface (per material) wins
@@ -1288,8 +1381,9 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     const j = joinParts(list);
     const cr = cls !== CLS.TIRE ? crease : 60;
     const cn = creaseNormals(j.V, j.F, cr);
-    const Nn = transferNormals(cn.V, cn.N, hiGrid, hiN);
-    if (cls === CLS.GLASS) outwardNormals(cn.V, Nn, yMid);
+    const Nt = transferNormals(cn.V, cn.N, hiGrid, hiN);
+    if (cls === CLS.GLASS) outwardNormals(cn.V, Nt, yMid);
+    const Nn = cls === CLS.TIRE ? Nt : filteredNormals(cn.V, Nt, hiFace);
     const a = list.map((p) => faceAreas(p.V, p.F, false).reduce((s, v) => s + v, 0));
     const aw = a.map((v) => v + 1e-12), asum = aw.reduce((s, v) => s + v, 0);
     let color = [0, 1, 2].map((c) => list.reduce((s, p, i) => s + p.mat.color[c] * aw[i], 0) / asum);

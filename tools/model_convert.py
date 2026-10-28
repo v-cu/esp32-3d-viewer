@@ -1309,6 +1309,13 @@ def convert(args):
     log(f"Loading {args.input}")
     parts = load_parts(args.input)
     log(f"  {len(parts)} parts, {sum(len(p['mesh'].faces) for p in parts)} triangles")
+    # fully transparent materials (alpha 0: hidden helpers, texture blend cards) are invisible
+    n_inv = len(parts)
+    parts = [p for p in parts if p["mat"]["alpha"] >= 0.03]
+    if not parts:
+        sys.exit("No visible triangle meshes found")
+    if len(parts) < n_inv:
+        log(f"  skipped {n_inv - len(parts)} invisible parts (alpha 0)")
 
     # ---- classify
     overrides = {k.lower(): v for k, v in cfg.get("materials", {}).items()}

@@ -136,6 +136,25 @@ export class PointGrid {
     this.map = map; this.start = start; this.items = items;
     this.key = new Int32Array(3);
   }
+  // calls cb(index) for every point within r of (x, y, z)
+  within(x, y, z, r, cb) {
+    const inv = this.inv, P = this.P, key = this.key, r2 = r * r;
+    const k = Math.max(1, Math.ceil(r * inv));
+    const cx = Math.floor(x * inv), cy = Math.floor(y * inv), cz = Math.floor(z * inv);
+    for (let dx = -k; dx <= k; dx++)
+      for (let dy = -k; dy <= k; dy++)
+        for (let dz = -k; dz <= k; dz++) {
+          key[0] = cx + dx; key[1] = cy + dy; key[2] = cz + dz;
+          const c = this.map.get(key, 0);
+          if (c < 0) continue;
+          for (let q = this.start[c]; q < this.start[c + 1]; q++) {
+            const i = this.items[q];
+            const ex = P[3 * i] - x, ey = P[3 * i + 1] - y, ez = P[3 * i + 2] - z;
+            if (ex * ex + ey * ey + ez * ez <= r2) cb(i);
+          }
+        }
+  }
+
   // nearest point index within maxDist (or -1); returns distance in this.lastDist
   nearest(x, y, z, maxDist) {
     const inv = this.inv, P = this.P, key = this.key;
