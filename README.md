@@ -153,8 +153,12 @@ What the converter does automatically:
   shadow planes under the model
 - lamps without telling material names are found by position and colour (white / amber at
   the front, red at the rear)
-- textured objects keep the brightness detail of the texture (stored per vertex), the colour
-  regions follow the hue
+- textured objects keep the brightness detail of the texture (stored per vertex); colour
+  regions of one texture are simplified together, so no cracks open between them
+- textured paint = livery (several paint colours, the largest one is the body colour that
+  `--paint` changes); a wheel texture is split into rim and tyre
+- unlit materials (`KHR_materials_unlit`, light baked into the texture, common for scanned and
+  AI generated models) are shown as they are, without extra studio light and AO
 - finds the front of the car from the lamp colours
 - decimates to the budget, giving the body most of the triangles
 - transfers smooth normals from the original mesh, bakes ambient occlusion, renders a

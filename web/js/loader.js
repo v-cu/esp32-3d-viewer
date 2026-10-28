@@ -49,6 +49,7 @@ function materialInfo(mat, hasMtl) {
   if (typeof mat.metalness === 'number') info.metallic = mat.metalness;
   if (typeof mat.roughness === 'number') info.roughness = mat.roughness;
   info.doubleSided = mat.side === THREE.DoubleSide;
+  info.unlit = !!mat.isMeshBasicMaterial;          // KHR_materials_unlit: light baked into the texture
   return info;
 }
 

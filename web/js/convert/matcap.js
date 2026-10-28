@@ -149,7 +149,7 @@ function tonemap1(c) {
 const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => v / 16 - 0.5);
 
 // returns { rgb565: Uint16Array(size*size), srgb: Float32Array(size*size*3) }
-export function renderMatcap(cls, color, size, roughHint = 0.5) {
+export function renderMatcap(cls, color, size, roughHint = 0.5, opts = {}) {
   const S = size * 2;
   const G = cached('g' + S, () => grid(S));
   const irr = cached('i' + S, () => envIrradiance(G.n));
@@ -159,7 +159,36 @@ export function renderMatcap(cls, color, size, roughHint = 0.5) {
   const fres = (f0, k) => f0 + (1 - f0) * (1 - G.ndv[k]) ** 5;
   const clampc = (lo, hi) => c.map((v) => Math.min(Math.max(v, lo), hi));
   let E1, E2;
+  if (opts.unlit) {
+    // unlit material: the texture already holds the light; only a hint of form
+    const rgb565 = new Uint16Array(size * size), srgb = new Float32Array(size * size * 3);
+    for (let j = 0; j < size; j++)
+      for (let i = 0; i < size; i++) {
+        const k = (2 * j) * S + 2 * i, sh = 0.86 + 0.14 * G.ndv[k];
+        const dith = BAYER[(j & 3) * 4 + (i & 3)] * 0.9;
+        const px = c.map((v) => linToSrgb1(v * sh));
+        srgb.set(px, 3 * (j * size + i));
+        const r = Math.min(Math.max(Math.floor(px[0] * 31 + 0.5 + dith), 0), 31);
+        const g = Math.min(Math.max(Math.floor(px[1] * 63 + 0.5 + dith), 0), 63);
+        const b = Math.min(Math.max(Math.floor(px[2] * 31 + 0.5 + dith), 0), 31);
+        rgb565[j * size + i] = (r << 11) | (g << 5) | b;
+      }
+    return { rgb565, srgb };
+  }
+  if (opts.object && (cls === CLS.GENERIC || cls === CLS.PLASTIC)) {
+    // figures and objects: brighter, softer light than car trim so the colours read true
+    const rough = Math.min(Math.max(roughHint, 0.25), 0.8);
+    E1 = blur(Math.round(rough * 1000) / 1000);
+    const base = cls === CLS.PLASTIC ? clampc(0.0, 0.35) : c;
+    for (let k = 0; k < N; k++) {
+      const f = fres(0.04, k);
+      for (let ch = 0; ch < 3; ch++)
+        out[3 * k + ch] = base[ch] * (irr[3 * k + ch] * 1.25 + 0.10) + f * E1[3 * k + ch] * (1 - rough * 0.7) * 0.7;
+    }
+    cls = -1;                                         // skip the switch below
+  }
   switch (cls) {
+    case -1: break;
     case CLS.PAINT: {
       E1 = blur(0.30); E2 = blur(0.035);
       for (let k = 0; k < N; k++) {

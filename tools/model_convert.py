@@ -67,6 +67,8 @@ CLS_IMPORTANCE = {CLS_PAINT: 2.6, CLS_GLASS: 1.1, CLS_CHROME: 1.0, CLS_METAL: 0.
 CLS_MATCAP = {CLS_PAINT: 128, CLS_GLASS: 128, CLS_CHROME: 128}
 
 # classes whose texture brightness detail is kept per vertex
+WHEEL_RX = re.compile(r"wheel|rim|tyre|tire|felg")
+LIVERY_RX = re.compile(r"paint|(?<![a-z])lack")          # a textured paint material = livery
 TEX_DETAIL_CLS = (CLS_GENERIC, CLS_PLASTIC, CLS_INTERIOR, CLS_PAINT, CLS_LIGHT_RED, CLS_LIGHT_CLEAR)
 
 MAGIC = b"R3DM"
@@ -248,7 +250,26 @@ def split_by_texture(V, F, col, max_colors, l_weight=1.0):
     return lbl, np.array(colors)
 
 
+def _unlit_material_names(path):
+    """names of glTF materials with KHR_materials_unlit (light baked into the texture)"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if data[:4] == b"glTF":
+            n = struct.unpack_from("<I", data, 12)[0]
+            g = json.loads(data[20:20 + n])
+        elif path.lower().endswith(".gltf"):
+            g = json.loads(data)
+        else:
+            return set()
+        return {m.get("name") or "default" for m in g.get("materials", [])
+                if "KHR_materials_unlit" in (m.get("extensions") or {})}
+    except Exception:
+        return set()
+
+
 def load_parts(path):
+    unlit = _unlit_material_names(path)
     scene = trimesh.load(path, force="scene")
     parts = []
     for node in scene.graph.nodes_geometry:
@@ -259,6 +280,7 @@ def load_parts(path):
         m = geom.copy()
         m.apply_transform(T)
         info = material_info(geom)
+        info["unlit"] = info["name"] in unlit
         parts.append(dict(name=str(node), mesh=m, mat=info, tex_geom=geom))
     if not parts:
         sys.exit("No triangle meshes found in " + path)
@@ -459,10 +481,10 @@ def atlas_region_class(srgb, cx):
     return CLS_GENERIC, srgb
 
 
-def _is_atlas(col, n_faces):
+def _is_atlas(col, n_faces, min_faces=1500):
     """A textured car material whose texture holds very different surfaces (trim + lights +
     windows) - its average colour would be meaningless."""
-    if n_faces < 1500:
+    if n_faces < min_faces:
         return False
     if col is None:
         return False
@@ -516,6 +538,9 @@ def merge_by_material(parts):
     return out
 
 
+_SPLIT_ID = 0
+
+
 def apply_texture_split(parts, is_car, max_colors):
     """Textured parts -> one part per colour region (see split_by_texture).
     object mode: every textured part (figures, toys: all colour comes from the texture)
@@ -539,13 +564,19 @@ def apply_texture_split(parts, is_car, max_colors):
                 mode = "object"
             elif p["cls"] in (CLS_LIGHT_RED, CLS_LIGHT_CLEAR):
                 mode = "light"
+            elif p["cls"] == CLS_PAINT and p.get("paint_by_name"):           # livery
+                mode = "paint" if _is_atlas(fcol, len(p["F"]), 300) else None
+            elif p["cls"] == CLS_METAL and WHEEL_RX.search((p["mat"]["name"] + " " + p["name"]).lower()):
+                mode = "wheel" if _is_atlas(fcol, len(p["F"]), 300) else None   # rim + tyre texture
             elif p["cls"] in (CLS_GENERIC, CLS_PLASTIC, CLS_PAINT, CLS_INTERIOR):
                 mode = "atlas" if _is_atlas(fcol, len(p["F"])) else None
         lbl = colors = None
         if mode:
             try:
-                k = max_colors if mode == "object" else (min(max_colors, 6) if mode == "light" else min(max_colors, 10))
-                lbl, colors = split_by_texture(p["V"], p["F"], fcol, k, 0.5 if mode == "object" else 1.0)
+                k = max_colors if mode == "object" else (min(max_colors, 6) if mode in ("light", "paint") else
+                                                         (min(max_colors, 5) if mode == "wheel" else min(max_colors, 10)))
+                lw = 0.8 if mode == "object" else (0.4 if mode == "paint" else 1.0)
+                lbl, colors = split_by_texture(p["V"], p["F"], fcol, k, lw)
             except Exception as e:                     # never fail the conversion because of it
                 log(f"  texture split skipped for '{p['name']}': {e}")
         if lbl is None or colors is None or len(colors) < 2 or len(lbl) != len(p["F"]):
@@ -553,6 +584,14 @@ def apply_texture_split(parts, is_car, max_colors):
             continue
         cen = p["V"][p["F"]].mean(1)
         summary = []
+        global _SPLIT_ID
+        _SPLIT_ID += 1
+        split_id = _SPLIT_ID
+        main_region = 0
+        if mode == "paint":                  # livery: the largest region is the body colour
+            Vq, Fq = p["V"], p["F"]
+            ar = np.linalg.norm(np.cross(Vq[Fq[:, 1]] - Vq[Fq[:, 0]], Vq[Fq[:, 2]] - Vq[Fq[:, 0]]), axis=1)
+            main_region = int(np.argmax(np.bincount(lbl, weights=ar, minlength=len(colors))))
         for r, c in enumerate(colors):
             fm = lbl == r
             if not fm.any():
@@ -565,6 +604,12 @@ def apply_texture_split(parts, is_car, max_colors):
             elif mode == "light":
                 cls, col = light_region_class(c, cx)
                 pieces = [(fm, cls, col)]
+            elif mode == "paint":
+                pieces = [(fm, CLS_PAINT, c)]
+            elif mode == "wheel":
+                lum = float(np.dot(c, [0.2126, 0.7152, 0.0722])); sat = float(np.ptp(c))
+                pieces = [(fm, CLS_TIRE if lum < 0.22 and sat < 0.12 else
+                               (CLS_CHROME if lum > 0.55 and sat < 0.15 else CLS_METAL), c)]
             else:
                 cls, col = atlas_region_class(c, cx)
                 if cls is None:                           # dark: windows above the beltline
@@ -582,7 +627,10 @@ def apply_texture_split(parts, is_car, max_colors):
                 mi["color"] = srgb_to_linear(np.asarray(col))
                 mi["name"] = f"{p['mat']['name']}_c{r}{'abcd'[j] if len(pieces) > 1 else ''}"
                 out.append(dict(name=f"{p['name']}_c{r}_{j}", mat=mi, cls=cls, V=p["V"][used],
-                                F=remap[Fp], from_split=True, fcol=fcol[m], tex_detail=True))
+                                F=remap[Fp], from_split=True, fcol=fcol[m], tex_detail=True, split_group=split_id))
+                if mode == "paint":
+                    out[-1]["paint_src"] = p["mat"]["name"]
+                    out[-1]["paint_key"] = "main" if r == main_region else f"l{r}"
                 summary.append(f"{CLS_NAMES[cls]}:{int(m.sum())}")
         log(f"  '{p['name'][:40]}' ({mode}): {len(colors)} colour regions -> {' '.join(summary)}")
     return out
@@ -783,6 +831,42 @@ def meshopt_simplify(V, F, target, lock_border=False):
     return dst[:n].reshape(-1, 3).astype(np.int64)
 
 
+def split_groups(parts):
+    """part indices grouped by the surface they were split from (colour regions of one texture)"""
+    by, out = {}, []
+    for i, p in enumerate(parts):
+        g = p.get("split_group")
+        if g is None:
+            out.append([i])
+            continue
+        if g not in by:
+            by[g] = []
+            out.append(by[g])
+        by[g].append(i)
+    return out
+
+
+def merge_parts(plist):
+    """several parts -> one welded mesh (shared border vertices), owner per face, face centroids"""
+    offs = np.cumsum([0] + [len(p["V"]) for p in plist])[:-1]
+    V = np.concatenate([p["V"] for p in plist])
+    F = np.concatenate([p["F"] + o for p, o in zip(plist, offs)]).astype(np.int64)
+    own = np.concatenate([np.full(len(p["F"]), k) for k, p in enumerate(plist)])
+    V2, _, inv = weld(V, F, 1e-5, return_inv=True)
+    F2 = inv[F]
+    good = (F2[:, 0] != F2[:, 1]) & (F2[:, 1] != F2[:, 2]) & (F2[:, 0] != F2[:, 2])
+    F2, own = F2[good], own[good]
+    return V2, F2, own, V2[F2].mean(1)
+
+
+def face_owners(V, own, cen, D):
+    """owner of each simplified triangle = owner of the nearest original face (by centroid)"""
+    if len(D) == 0:
+        return np.zeros(0, np.int64)
+    _, q = cKDTree(cen).query(V[D].mean(1))
+    return own[q]
+
+
 def dedupe_faces(F):
     """Remove triangles that use the same 3 vertices (double-sided duplicates, copies)."""
     key = np.sort(F, axis=1)
@@ -954,7 +1038,7 @@ def tonemap(c):
     return linear_to_srgb(c)
 
 
-def render_matcap(cls, color, size, rough_hint=0.5):
+def render_matcap(cls, color, size, rough_hint=0.5, unlit=False, obj=False):
     out_size = size
     size = size * 2                                 # 2x supersampling, box-filtered below
     t = (np.arange(size) + 0.5) / size * 2 - 1
@@ -976,7 +1060,16 @@ def render_matcap(cls, color, size, rough_hint=0.5):
     c = np.asarray(color, dtype=np.float64)
     irr = env_irradiance(n)
 
-    if cls == CLS_PAINT:
+    if unlit:                           # light baked into the texture: only a hint of form
+        sh = (0.86 + 0.14 * ndv)[..., None]
+        srgb = linear_to_srgb(c * sh).reshape(out_size, 2, out_size, 2, 3)[:, 0, :, 0, :]
+        return _quantize565(srgb, out_size), srgb
+    if obj and cls in (CLS_GENERIC, CLS_PLASTIC):
+        # figures and objects: brighter, softer light than car trim so the colours read true
+        rough = float(np.clip(rough_hint, 0.25, 0.8))
+        base = np.clip(c, 0.0, 0.35) if cls == CLS_PLASTIC else c
+        out = base * (irr * 1.25 + 0.10) + fres(0.04)[..., None] * env_blurred(refl, rough) * (1.0 - rough * 0.7) * 0.7
+    elif cls == CLS_PAINT:
         diffuse = c * irr * 0.9
         flake = c * env_blurred(refl, 0.30) * 0.45            # metallic base layer
         coat = fres(0.04)[..., None] * env_blurred(refl, 0.035) * 0.9
@@ -1009,14 +1102,17 @@ def render_matcap(cls, color, size, rough_hint=0.5):
     out = out.reshape(out_size, 2, out_size, 2, 3).mean((1, 3))
     size = out_size
     srgb = tonemap(out)
-    # ordered dither while quantising to RGB565
+    return _quantize565(srgb, size), srgb
+
+
+def _quantize565(srgb, size):
+    """ordered dither while quantising to RGB565"""
     bayer = np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]) / 16.0 - 0.5
     dith = np.tile(bayer, (size // 4 + 1, size // 4 + 1))[:size, :size]
     r = np.clip(np.floor(srgb[..., 0] * 31 + 0.5 + dith * 0.9), 0, 31).astype(np.uint16)
     g = np.clip(np.floor(srgb[..., 1] * 63 + 0.5 + dith * 0.9), 0, 63).astype(np.uint16)
     b = np.clip(np.floor(srgb[..., 2] * 31 + 0.5 + dith * 0.9), 0, 31).astype(np.uint16)
-    rgb565 = (r << 11) | (g << 5) | b
-    return rgb565, srgb
+    return (r << 11) | (g << 5) | b
 
 
 # --------------------------------------------------------------------------------------
@@ -1181,6 +1277,7 @@ def convert(args):
             p["cls"] = CLS_DROP if ov == "drop" else CLS_NAMES.index(ov)
         else:
             p["cls"] = classify(p)
+            p["paint_by_name"] = p["cls"] == CLS_PAINT and bool(LIVERY_RX.search((p["mat"]["name"] + " " + p["name"]).lower()))
 
     normalise_orientation(parts, cfg)
     parts = [p for p in parts if p["cls"] != CLS_DROP]
@@ -1275,24 +1372,26 @@ def convert(args):
                                             {p["mat"]["name"] for p in parts if p["cls"] == CLS_PAINT}):
         score = {}
         for i, p in enumerate(parts):
-            if p["cls"] not in (CLS_GENERIC, CLS_PLASTIC, CLS_PAINT) or p.get("from_split"):
+            if p["cls"] not in (CLS_GENERIC, CLS_PLASTIC, CLS_PAINT) or (p.get("from_split") and not p.get("paint_src")):
                 continue
             a = areas[(owner == i) & vis].sum()
             srgb = linear_to_srgb(p["mat"]["color"])
             sat = float(np.ptp(srgb))
-            sc = a * (0.25 + 1.5 * sat) * (0.5 if p.get("tex_geom") is not None else 1.0)
+            sc = a * (0.25 + 1.5 * sat) * 0.5
             if p["cls"] == CLS_PAINT:
                 sc *= 1.5
-            score[p["mat"]["name"]] = score.get(p["mat"]["name"], 0.0) + sc
+            k = p.get("paint_src") or p["mat"]["name"]       # a livery competes with all its regions
+            score[k] = score.get(k, 0.0) + sc
         if score:
             mname = max(score, key=score.get)
             for p in parts:
-                if p["mat"]["name"] == mname:
+                if (p.get("paint_src") or p["mat"]["name"]) == mname:
                     p["cls"] = CLS_PAINT
                 elif p["cls"] == CLS_PAINT:            # lost: back to a neutral class
                     lum = float(np.dot(p["mat"]["color"], [0.2126, 0.7152, 0.0722]))
                     p["cls"] = CLS_PLASTIC if lum < 0.02 else CLS_GENERIC
-            log(f"  paint: material '{mname}'")
+                    p["paint_key"] = None
+            log(f"  paint: material '{mname}'" + (" (with livery)" if any(p.get("paint_src") == mname for p in parts) else ""))
 
     tot_area = np.array([areas[owner == i].sum() for i in range(len(parts))])
     vis_area0 = np.array([areas[(owner == i) & vis].sum() for i in range(len(parts))])
@@ -1310,11 +1409,22 @@ def convert(args):
     total = sum(len(p["F"]) for p in parts)
     keep = min(1.0, 5.0 * budget / max(total, 1))
     if keep < 1.0:
-        for p in parts:
-            if len(p["F"]) == 0:
+        # colour regions of one surface are simplified together (shared borders, no cracks)
+        for idxs in split_groups(parts):
+            live = [i for i in idxs if len(parts[i]["F"])]
+            if not live:
                 continue
-            Vp, Fp = weld(p["V"], p["F"], 1e-5)
-            p["V"], p["F"] = decimate(Vp, Fp, max(64, int(len(Fp) * keep)))
+            Vm, Fm, own, cen = merge_parts([parts[i] for i in live])
+            if not len(Fm):
+                continue
+            target = max(64, int(len(Fm) * keep))
+            D = meshopt_simplify(Vm, Fm, target) if (meshopt is not None and len(Fm) > target) else Fm
+            fo = face_owners(Vm, own, cen, D) if len(live) > 1 else np.zeros(len(D), np.int64)
+            for k, i in enumerate(live):
+                Fk = D[fo == k]
+                used = np.unique(Fk)
+                remap = -np.ones(len(Vm), np.int64); remap[used] = np.arange(len(used))
+                parts[i]["V"], parts[i]["F"] = Vm[used], remap[Fk]
         log(f"  stage-1 decimation: {total} -> {sum(len(p['F']) for p in parts)} triangles")
     offs, Vs, Fs, owner = 0, [], [], []
     for i, p in enumerate(parts):
@@ -1329,72 +1439,61 @@ def convert(args):
     # All parts are simplified together so the quadric error decides where triangles are
     # needed. Each part is scaled about its centroid by an importance factor (error ~ s^2);
     # meshoptimizer keeps original vertices, so faces map straight back to their part.
-    pieces, info = [], []
+    pieces = []
     voff = 0
-    for i, p in enumerate(parts):
-        m = (owner == i) & vis
-        if not m.any():
+    for idxs in split_groups(parts):
+        live = [i for i in idxs if len(parts[i]["F"])]
+        if not live:
             continue
-        Fp = F[m]
-        used = np.unique(Fp)
-        remap = -np.ones(len(V), np.int64); remap[used] = np.arange(len(used))
-        Vp = V[used]; Fp = remap[Fp]
-        Vp, Fp = weld(Vp, Fp, 1e-5)
+        Vp, Fp, own, cen = merge_parts([parts[i] for i in live])
         if len(Fp) == 0:
             continue
-        frac = vis_area0[i] / max(tot_area[i], 1e-12)
-        s_i = CLS_IMPORTANCE[p["cls"]] * (0.35 + 0.65 * math.sqrt(frac))
+        w = np.array([max(tot_area[i], 1e-12) for i in live])
+        s_all = np.array([CLS_IMPORTANCE[parts[i]["cls"]] * (0.35 + 0.65 * math.sqrt(vis_area0[i] / max(tot_area[i], 1e-12)))
+                          for i in live])
+        s_i = float((s_all * w).sum() / w.sum())            # colour regions: area weighted importance
         c_i = Vp.mean(0)
-        pieces.append((Vp, (Vp - c_i) * s_i + c_i, Fp + voff, np.full(len(Vp), len(info)), s_i, c_i))
-        info.append(i)
+        pieces.append(dict(live=live, OV=Vp, SV=(Vp - c_i) * s_i + c_i, F=Fp + voff, own=own, cen=cen, voff=voff))
         voff += len(Vp)
-    OV = np.concatenate([q[0] for q in pieces])          # original positions
-    SV = np.concatenate([q[1] for q in pieces])          # importance-scaled positions
-    GF = np.concatenate([q[2] for q in pieces])
-    vowner = np.concatenate([q[3] for q in pieces])
+    OV = np.concatenate([q["OV"] for q in pieces])          # original positions
+    SV = np.concatenate([q["SV"] for q in pieces])          # importance-scaled positions
+    GF = np.concatenate([q["F"] for q in pieces])
+    vowner = np.concatenate([np.full(len(q["OV"]), k) for k, q in enumerate(pieces)])
     log(f"  global decimation: {len(GF)} -> {budget} triangles")
     if len(GF) > budget and meshopt is not None:
         DF = meshopt_simplify(SV, GF, budget)
-        DV = OV
-    elif len(GF) > budget and fast_simplification is not None:
-        # fallback: separate parts by a big X offset so they can be recovered afterwards
-        SEP = 10.0
-        TV = SV + np.stack([vowner * SEP, np.zeros(len(SV)), np.zeros(len(SV))], 1)
-        DV, DF = fast_simplification.simplify(TV, GF.astype(np.int64), target_count=int(budget),
-                                              agg=float(args.agg), preserve_border=True)
-        DV = np.asarray(DV, np.float64)
-        vown = np.clip(np.round(DV[:, 0] / SEP).astype(np.int64), 0, len(info) - 1)
-        DV[:, 0] -= vown * SEP
-        # undo importance scaling per part
-        for k in range(len(info)):
-            sel = vown == k
-            s_i, c_i = pieces[k][4], pieces[k][5]
-            DV[sel] = (DV[sel] - c_i) / s_i + c_i
-        vowner = vown
-        DF = np.asarray(DF, np.int64)
     else:
-        DV, DF = OV, GF
+        DF = GF
+    DV = OV
     fk = vowner[DF[:, 0]]
     out_parts = []
-    for k, i in enumerate(info):
-        fm = fk == k
-        if not fm.any():
+    for k, q in enumerate(pieces):
+        Fk_all = DF[fk == k]
+        if not len(Fk_all):
             continue
-        Fk = DF[fm]
-        used = np.unique(Fk)
-        remap = -np.ones(len(DV), np.int64); remap[used] = np.arange(len(used))
-        p = parts[i]
-        out_parts.append(dict(name=p["name"], cls=p["cls"], mat=p["mat"], V=DV[used], F=remap[Fk],
-                              tex_detail=bool(p.get("tex_detail")), hi_range=p.get("hi_range"),
-                              twosided=p.get("twosided", False)))
+        Floc = Fk_all - q["voff"]
+        fo = face_owners(q["OV"], q["own"], q["cen"], Floc) if len(q["live"]) > 1 else np.zeros(len(Floc), np.int64)
+        for kk, i in enumerate(q["live"]):
+            Fk = Floc[fo == kk]
+            if not len(Fk):
+                continue
+            used = np.unique(Fk)
+            remap = -np.ones(len(q["OV"]), np.int64); remap[used] = np.arange(len(used))
+            p = parts[i]
+            out_parts.append(dict(name=p["name"], cls=p["cls"], mat=p["mat"], V=q["OV"][used], F=remap[Fk],
+                                  tex_detail=bool(p.get("tex_detail")), hi_range=p.get("hi_range"),
+                                  twosided=p.get("twosided", False), paint_key=p.get("paint_key")))
     log(f"  after decimation: {sum(len(p['F']) for p in out_parts)} triangles")
 
     # ---- group by material (class + colour) -> one draw range each
     groups = {}
     for p in out_parts:
         c = p["mat"]["color"]
-        key = (p["cls"], _is_amber(linear_to_srgb(c))) if p["cls"] == CLS_LIGHT_CLEAR else \
-            (p["cls"],) if p["cls"] in (CLS_PAINT, CLS_GLASS, CLS_CHROME, CLS_TIRE, CLS_LIGHT_RED,
+        srgb6 = tuple(np.round(linear_to_srgb(c) * 6).astype(int))
+        key = ("u", p["cls"], srgb6) if p["mat"].get("unlit") else \
+            (p["cls"], "main" if p.get("paint_key") in (None, "main") else srgb6) if p["cls"] == CLS_PAINT else \
+            (p["cls"], _is_amber(linear_to_srgb(c))) if p["cls"] == CLS_LIGHT_CLEAR else \
+            (p["cls"],) if p["cls"] in (CLS_GLASS, CLS_CHROME, CLS_TIRE, CLS_LIGHT_RED,
                                         CLS_CARBON) else \
             (p["cls"], tuple(np.round(linear_to_srgb(c) * 6).astype(int)))
         groups.setdefault(key, []).append(p)
@@ -1442,7 +1541,9 @@ def convert(args):
     lod1_parts = []
     voff, toff = 0, 0
     for key, plist in groups.items():
-        cls = key[0]
+        unlit = key[0] == "u"
+        cls = key[1] if unlit else key[0]
+        main = cls == CLS_PAINT and key[1] == "main"
         Vg = np.concatenate([p["V"] for p in plist])
         Fg = np.concatenate([p["F"] + o for p, o in zip(plist, np.cumsum([0] + [len(q["V"]) for q in plist])[:-1])])
         crease = args.crease if cls != CLS_TIRE else 60
@@ -1466,12 +1567,12 @@ def convert(args):
                                               p["V"][p["F"][:, 2]] - p["V"][p["F"][:, 0]]), axis=1).sum() for p in plist])
         color = np.average([p["mat"]["color"] for p in plist], axis=0, weights=a + 1e-12)
         rough = float(np.average([p["mat"]["roughness"] for p in plist], weights=a + 1e-12))
-        if cls == CLS_PAINT and paint_lin is not None:
+        if cls == CLS_PAINT and paint_lin is not None and main:
             color = paint_lin
         # texture detail: brightness changes inside a colour region go into the per-vertex
         # light factor (the region has one colour), so a textured surface keeps its shading
         detail = None
-        if cls in TEX_DETAIL_CLS and any(p.get("tex_detail") for p in plist) and not (cls == CLS_PAINT and paint_lin is not None):
+        if (cls in TEX_DETAIL_CLS or unlit) and any(p.get("tex_detail") for p in plist) and not (cls == CLS_PAINT and paint_lin is not None and main):
             idx = np.concatenate([np.arange(p["hi_range"][0], p["hi_range"][0] + p["hi_range"][1])
                                   for p in plist if p.get("hi_range")] or [np.zeros(0, np.int64)])
             if len(idx):
@@ -1480,14 +1581,14 @@ def convert(args):
                 lum = np.where((d < 1e-5) & (hiCol[k, 0] >= 0), hiCol[k] @ np.array([0.2126, 0.7152, 0.0722]), -1.0)
                 valid = np.sort(lum[lum >= 0])
                 if len(valid) > 8:
-                    ref = valid[int(len(valid) * 0.92)]; mean = valid.mean()
+                    ref = valid[int(len(valid) * 0.8)]; mean = valid.mean()
                     if ref > 1e-4 and mean > 1e-4:
                         detail = np.where(lum < 0, 1.0, np.clip(lum / ref, 0.3, 1.0))
                         color = color * min(ref / mean, 1.0 / max(float(np.max(color)), 1e-6))
-        details.append((len(Vn), detail))
+        details.append((len(Vn), detail, unlit))
         allV.append(Vn); allN.append(Nn); allF.append(Fn + voff)
         dsided = any(p.get("twosided", False) for p in plist) or cls == CLS_GLASS
-        mats.append(dict(cls=cls, color=color, rough=rough, tri_start=toff, tri_count=len(Fn), dsided=dsided,
+        mats.append(dict(cls=cls, color=color, rough=rough, unlit=unlit, tri_start=toff, tri_count=len(Fn), dsided=dsided,
                          names=sorted({p["mat"]["name"] for p in plist})))
         voff += len(Vn); toff += len(Fn)
     V = np.concatenate(allV); N = np.concatenate(allN); F = np.concatenate(allF)
@@ -1502,7 +1603,9 @@ def convert(args):
         log("  baking ambient occlusion ...")
         ao = bake_ao(V, N, F, radius)
     o = 0
-    for n, d in details:
+    for n, d, unl in details:
+        if unl:                         # unlit material: light is baked into the texture, no AO
+            ao[o:o + n] = 1.0
         if d is not None:
             ao[o:o + n] = ao[o:o + n] * d
         o += n
@@ -1512,7 +1615,8 @@ def convert(args):
     matcap_imgs = []
     for m in mats:
         size = CLS_MATCAP.get(m["cls"], 64) if args.matcap_size == 0 else args.matcap_size
-        rgb565, srgb = render_matcap(m["cls"], m["color"], size, m["rough"])
+        rgb565, srgb = render_matcap(m["cls"], m["color"], size, m["rough"], unlit=m.get("unlit", False),
+                                     obj=not cfg.get("_is_car", True))
         m["matcap_size"] = size
         matcap_imgs.append((rgb565, srgb))
 

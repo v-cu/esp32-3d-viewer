@@ -18,6 +18,9 @@ const CLS_IMPORTANCE = {
   [CLS.PLASTIC]: 0.55, [CLS.LIGHT_RED]: 1.1, [CLS.LIGHT_CLEAR]: 1.2, [CLS.INTERIOR]: 0.3,
   [CLS.CARBON]: 0.8, [CLS.GENERIC]: 0.9,
 };
+const WHEEL_RX = /wheel|rim|tyre|tire|felg/;
+const LIVERY_RX = /paint|(?<![a-z])lack/;            // a textured paint material = livery
+let splitCounter = 0;
 const TEX_DETAIL_CLS = [CLS.GENERIC, CLS.PLASTIC, CLS.INTERIOR, CLS.PAINT, CLS.LIGHT_RED, CLS.LIGHT_CLEAR];
 
 // linear per-vertex colour from per-face sRGB colours (area weighted)
@@ -124,7 +127,7 @@ function kmeans(X, n, dim, k, rand) {
 }
 
 // cluster the per-face texture colours into regions -> {lbl, colors(sRGB)} or null
-function splitByTexture(p, maxColors, lWeight = 1.0) {
+function splitByTexture(p, maxColors, lWeight = 1.0, chromaMerge = 0) {
   if (!p.faceCol) return null;
   const F = p.F, V = p.V, nf = F.length / 3;
   const area = faceAreas(V, F);
@@ -151,7 +154,7 @@ function splitByTexture(p, maxColors, lWeight = 1.0) {
   const keep = [];
   for (const c of cent) if (keep.every((q) => Math.hypot(c[0] - q[0], c[1] - q[1], c[2] - q[2]) > 0.06)) keep.push(c);
   cent = keep;
-  const K = cent.length;
+  let K = cent.length;
   let lbl = new Int32Array(nf);
   for (let f = 0; f < nf; f++) {
     let best = 0, bd = Infinity;
@@ -161,6 +164,23 @@ function splitByTexture(p, maxColors, lWeight = 1.0) {
       if (d < bd) { bd = d; best = j; }
     }
     lbl[f] = best;
+  }
+  // clusters that differ only in brightness (light and shadow baked into the texture) are one
+  // region when the brightness is kept per vertex anyway
+  if (chromaMerge > 0 && K > 1) {
+    // complete linkage: a cluster joins a group only if it is close to every member
+    const cd = (i, j) => Math.hypot(cent[i][1] - cent[j][1], cent[i][2] - cent[j][2]);
+    const groups = [], g = new Int32Array(K);
+    for (let i = 0; i < K; i++) {
+      let gi = groups.findIndex((m) => m.every((j) => cd(i, j) < chromaMerge));
+      if (gi < 0) { gi = groups.length; groups.push([]); }
+      groups[gi].push(i);
+      g[i] = gi;
+    }
+    if (groups.length < K) {
+      for (let f = 0; f < nf; f++) lbl[f] = g[lbl[f]];
+      K = groups.length;
+    }
   }
   // adjacency over position-welded vertices (UV seams must not break it)
   const w = weldIndexOnly(V, F, 1e-6);
@@ -278,9 +298,9 @@ function atlasRegionClass(c, cx) {
   return [CLS.GENERIC, c];
 }
 
-function isAtlas(p) {
+function isAtlas(p, minFaces = 1500) {
   const nf = p.F.length / 3;
-  if (nf < 1500 || !p.faceCol) return false;
+  if (nf < minFaces || !p.faceCol) return false;
   let s = 0, s2 = 0, sat = 0;
   for (let f = 0; f < nf; f++) {
     const c = faceColor(p, f), l = dot3(c, LUM);
@@ -328,14 +348,19 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
     if (p.faceCol) {
       if (!isCar) mode = 'object';
       else if (p.cls === CLS.LIGHT_RED || p.cls === CLS.LIGHT_CLEAR) mode = 'light';
+      else if (p.cls === CLS.PAINT && p.paintByName) mode = isAtlas(p, 300) ? 'paint' : null;   // livery
+      else if (p.cls === CLS.METAL && WHEEL_RX.test((p.mat.name + ' ' + p.name).toLowerCase()))
+        mode = isAtlas(p, 300) ? 'wheel' : null;                             // rim + tyre in one texture
       else if ([CLS.GENERIC, CLS.PLASTIC, CLS.PAINT, CLS.INTERIOR].includes(p.cls)) mode = isAtlas(p) ? 'atlas' : null;
     }
     let res = null;
     if (mode) {
       try {
-        const k = mode === 'object' ? maxColors : mode === 'light' ? Math.min(maxColors, 6) : Math.min(maxColors, 10);
-        // objects: brightness detail is kept per vertex, so regions follow hue more than shading
-        res = splitByTexture(p, k, mode === 'object' ? 0.5 : 1.0);
+        const k = mode === 'object' ? maxColors : mode === 'light' || mode === 'paint' ? Math.min(maxColors, 6)
+          : mode === 'wheel' ? Math.min(maxColors, 5) : Math.min(maxColors, 10);
+        // objects / liveries: brightness detail is kept per vertex, so regions follow hue more
+        // than shading (baked light and shadow in the texture must not become separate colours)
+        res = splitByTexture(p, k, mode === 'object' ? 0.8 : mode === 'paint' ? 0.4 : 1.0, 0);
       } catch (e) {
         log(`  texture split skipped for '${p.name}': ${e.message}`);
       }
@@ -348,6 +373,14 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
       for (let c = 0; c < 3; c++)
         cen[3 * f + c] = (p.V[3 * p.F[3 * f] + c] + p.V[3 * p.F[3 * f + 1] + c] + p.V[3 * p.F[3 * f + 2] + c]) / 3;
     const summary = [];
+    const splitId = ++splitCounter;
+    // livery: the region with the largest area is the body colour
+    let mainRegion = 0;
+    if (mode === 'paint') {
+      const area = faceAreas(p.V, p.F), ra = new Float64Array(colors.length);
+      for (let f = 0; f < nf; f++) ra[lbl[f]] += area[f];
+      for (let r = 1; r < colors.length; r++) if (ra[r] > ra[mainRegion]) mainRegion = r;
+    }
     colors.forEach((c, r) => {
       const fm = new Uint8Array(nf);
       let n = 0, sx = 0;
@@ -361,6 +394,11 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
       } else if (mode === 'light') {
         const [cls, col] = lightRegionClass(c, cx);
         pieces = [[fm, cls, col]];
+      } else if (mode === 'paint') {
+        pieces = [[fm, CLS.PAINT, c]];
+      } else if (mode === 'wheel') {
+        const lum = dot3(c, LUM), sat = ptp3(c);
+        pieces = [[fm, lum < 0.22 && sat < 0.12 ? CLS.TIRE : lum > 0.55 && sat < 0.15 ? CLS.CHROME : CLS.METAL, c]];
       } else {
         const [cls, col] = atlasRegionClass(c, cx);
         if (cls === null) {
@@ -378,7 +416,9 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
         let q = 0;
         for (let f = 0; f < nf; f++) if (m[f]) { fc[q++] = p.faceCol[3 * f]; fc[q++] = p.faceCol[3 * f + 1]; fc[q++] = p.faceCol[3 * f + 2]; }
         const mi = { ...p.mat, color: srgbToLin(col), name: `${p.mat.name}_c${r}${pieces.length > 1 ? 'abcd'[j] : ''}` };
-        out.push({ name: `${p.name}_c${r}_${j}`, mat: mi, cls, V: sm.V, F: sm.F, faceCol: fc, fromSplit: true, texDetail: true });
+        const piece = { name: `${p.name}_c${r}_${j}`, mat: mi, cls, V: sm.V, F: sm.F, faceCol: fc, fromSplit: true, texDetail: true, splitGroup: splitId };
+        if (mode === 'paint') { piece.paintSplit = true; piece.paintSrc = p.mat.name; piece.paintKey = r === mainRegion ? 'main' : `l${r}`; }
+        out.push(piece);
         summary.push(`${CLS_NAMES[cls]}:${cntm}`);
       });
     });
@@ -682,17 +722,23 @@ function normaliseOrientation(parts, cfg) {
 // --------------------------------------------------------------------------------------
 // mesh processing
 // --------------------------------------------------------------------------------------
-function meshoptSimplify(V, F, target, lockBorder = false) {
+function meshoptSimplify(V, F, target, lockBorder = false, attr = null, attrWeight = 0) {
   const pos = new Float32Array(V);
   const idx = F instanceof Uint32Array ? F : new Uint32Array(F);
   const tic = Math.min(idx.length, Math.max(0, Math.floor(target)) * 3);
-  const [out] = MeshoptSimplifier.simplify(idx, pos, 3, tic, 1.0, lockBorder ? ['LockBorder'] : []);
+  const flags = lockBorder ? ['LockBorder'] : [];
+  // attr: per-vertex region colour; borders between colour regions are kept where possible
+  const [out] = attr
+    ? MeshoptSimplifier.simplifyWithAttributes(idx, pos, 3, attr, 3, [attrWeight, attrWeight, attrWeight], null, tic, 1.0, flags)
+    : MeshoptSimplifier.simplify(idx, pos, 3, tic, 1.0, flags);
   return out;
 }
 
-function decimate(V, F, target) {
+const REGION_ATTR_WEIGHT = 1.0;
+
+function decimate(V, F, target, lockBorder = false) {
   if (F.length / 3 <= target) return { V, F };
-  const F2 = meshoptSimplify(V, F, target);
+  const F2 = meshoptSimplify(V, F, target, lockBorder);
   return compactMesh(V, F2);
 }
 
@@ -770,6 +816,68 @@ function transferNormals(V, N, grid, hiN, maxAngleDeg = 28) {
   return out;
 }
 
+// part indices grouped by the surface they were split from (colour regions of one texture)
+function splitGroups(parts) {
+  const by = new Map(), out = [];
+  parts.forEach((p, i) => {
+    if (p.splitGroup === undefined) { out.push([i]); return; }
+    if (!by.has(p.splitGroup)) { by.set(p.splitGroup, []); out.push(by.get(p.splitGroup)); }
+    by.get(p.splitGroup).push(i);
+  });
+  return out;
+}
+
+// several parts -> one welded mesh (shared border vertices) + owner (list index) per face
+function mergeParts(list) {
+  const j = joinParts(list);
+  const w = weld(j.V, j.F, 1e-5);
+  // weld drops degenerate faces: rebuild the owner per kept face
+  const owner = new Int32Array(w.F.length / 3);
+  let o = 0;
+  for (let f = 0; f < j.F.length / 3; f++) {
+    const a = w.inv[j.F[3 * f]], b = w.inv[j.F[3 * f + 1]], c = w.inv[j.F[3 * f + 2]];
+    if (a === b || b === c || a === c) continue;
+    owner[o++] = j.owner[f];
+  }
+  const nf = owner.length, cen = new Float64Array(nf * 3);
+  for (let f = 0; f < nf; f++)
+    for (let k = 0; k < 3; k++) cen[3 * f + k] = (w.V[3 * w.F[3 * f] + k] + w.V[3 * w.F[3 * f + 1] + k] + w.V[3 * w.F[3 * f + 2] + k]) / 3;
+  // region colour per vertex (OKLab of the owner with most incident faces)
+  let attr = null;
+  if (list.length > 1) {
+    const nv = w.V.length / 3, K = list.length, cnt = new Uint16Array(nv * Math.min(K, 64)), best = new Int32Array(nv);
+    const KK = Math.min(K, 64);
+    for (let f = 0; f < nf; f++) {
+      const o2 = Math.min(owner[f], KK - 1);
+      for (let k = 0; k < 3; k++) { const v = w.F[3 * f + k]; if (++cnt[v * KK + o2] > cnt[v * KK + best[v]]) best[v] = o2; }
+    }
+    const labs = list.map((p) => { const c = linToSrgb(p.mat.color), o3 = [0, 0, 0]; srgbToOklab(c[0], c[1], c[2], o3, 0); return o3; });
+    attr = new Float32Array(nv * 3);
+    for (let v = 0; v < nv; v++) { const l = labs[best[v]]; attr[3 * v] = l[0]; attr[3 * v + 1] = l[1] * 1.6; attr[3 * v + 2] = l[2] * 1.6; }
+  }
+  return { V: w.V, F: w.F, owner, cen, attr };
+}
+
+// owner of each simplified triangle = owner of the nearest original face (by centroid)
+function faceOwners(m, D) {
+  const nf = D.length / 3, out = new Int32Array(nf);
+  if (!m.grid) {
+    let ext = 0;
+    for (let i = 0; i < m.V.length; i++) ext = Math.max(ext, Math.abs(m.V[i]));
+    m.cell = Math.max(ext / 200, 1e-4);
+    m.grid = new PointGrid(m.cen, m.cell);
+  }
+  for (let f = 0; f < nf; f++) {
+    let x = 0, y = 0, z = 0;
+    for (let k = 0; k < 3; k++) { const v = 3 * D[3 * f + k]; x += m.V[v]; y += m.V[v + 1]; z += m.V[v + 2]; }
+    x /= 3; y /= 3; z /= 3;
+    let r = m.cell, q = -1;
+    for (let it = 0; it < 6 && q < 0; it++, r *= 3) q = m.grid.nearest(x, y, z, r);
+    out[f] = q >= 0 ? m.owner[q] : m.owner[0];
+  }
+  return out;
+}
+
 function outwardNormals(V, N, yMid) {
   for (let i = 0; i < V.length; i += 3) {
     const d = V[i] * N[i] + (V[i + 1] - yMid) * N[i + 1] + V[i + 2] * N[i + 2];
@@ -832,7 +940,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   for (const p of parts) {
     const ov = overrides[p.name.toLowerCase()] ?? overrides[p.mat.name.toLowerCase()];
     if (ov !== undefined && (ov === 'drop' || CLS_NAMES.includes(ov))) p.cls = ov === 'drop' ? CLS_DROP : CLS_NAMES.indexOf(ov);
-    else p.cls = classify(p);
+    else { p.cls = classify(p); p.paintByName = p.cls === CLS.PAINT && LIVERY_RX.test((p.mat.name + ' ' + p.name).toLowerCase()); }
   }
   cfg._log = log;
   normaliseOrientation(parts, cfg);
@@ -929,24 +1037,29 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   // ---- car paint: the biggest visible saturated surface (per material) wins
   const paintMatNames = new Set(parts.filter((p) => p.cls === CLS.PAINT).map((p) => p.mat.name.toLowerCase()));
   if (cfg._isCar && ![...paintMatNames].some((k) => k in overrides)) {
+    // a paint material with a livery competes with its colour regions (paintSrc)
     const visArea = new Float64Array(parts.length);
     for (let f = 0; f < nf; f++) if (vis[f]) visArea[owner[f]] += areas[f];
     const score = new Map();
     parts.forEach((p, i) => {
-      if (![CLS.GENERIC, CLS.PLASTIC, CLS.PAINT].includes(p.cls) || p.fromSplit) return;
+      if (![CLS.GENERIC, CLS.PLASTIC, CLS.PAINT].includes(p.cls) || (p.fromSplit && !p.paintSplit)) return;
       const sat = ptp3(linToSrgb(p.mat.color));
       let sc = visArea[i] * (0.25 + 1.5 * sat) * 0.5;
       if (p.cls === CLS.PAINT) sc *= 1.5;
-      score.set(p.mat.name, (score.get(p.mat.name) || 0) + sc);
+      const k = p.paintSrc || p.mat.name;
+      score.set(k, (score.get(k) || 0) + sc);
     });
     if (score.size) {
       let mname = null, best = -Infinity;
       for (const [k, v] of score) if (v > best) { best = v; mname = k; }
       for (const p of parts) {
-        if (p.mat.name === mname) p.cls = CLS.PAINT;
-        else if (p.cls === CLS.PAINT) p.cls = dot3(p.mat.color, LUM) < 0.02 ? CLS.PLASTIC : CLS.GENERIC;
+        if ((p.paintSrc || p.mat.name) === mname) p.cls = CLS.PAINT;
+        else if (p.cls === CLS.PAINT) {
+          p.cls = dot3(p.mat.color, LUM) < 0.02 ? CLS.PLASTIC : CLS.GENERIC;
+          p.paintKey = undefined;
+        }
       }
-      log(`  paint: material '${mname}'`);
+      log(`  paint: material '${mname}'${parts.some((p) => p.paintSrc === mname) ? ' (with livery)' : ''}`);
     }
   }
 
@@ -963,33 +1076,49 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   const total = parts.reduce((s, p) => s + p.F.length / 3, 0);
   const keepFrac = Math.min(1, 5 * budget / Math.max(total, 1));
   if (keepFrac < 1) {
-    for (const p of parts) {
-      if (!p.F.length) continue;
-      const w = weld(p.V, p.F, 1e-5);
-      const d = decimate(w.V, w.F, Math.max(64, Math.floor(w.F.length / 3 * keepFrac)));
-      p.V = d.V; p.F = d.F;
+    // colour regions of one surface are simplified together (shared borders, no cracks)
+    for (const list of splitGroups(parts)) {
+      const live = list.filter((i) => parts[i].F.length);
+      if (!live.length) continue;
+      const m = mergeParts(live.map((i) => parts[i]));
+      if (!m.F.length) continue;
+      const D = meshoptSimplify(m.V, m.F, Math.max(64, Math.floor(m.F.length / 3 * keepFrac)), false, m.attr, REGION_ATTR_WEIGHT);
+      const own = faceOwners(m, D);
+      live.forEach((i, k) => {
+        const mask = new Uint8Array(D.length / 3);
+        for (let f = 0; f < mask.length; f++) mask[f] = own[f] === k ? 1 : 0;
+        const sm = subMesh(m.V, D, mask);
+        parts[i].V = sm.V; parts[i].F = sm.F;
+      });
     }
     log(`  stage-1 decimation: ${total} -> ${parts.reduce((s, p) => s + p.F.length / 3, 0)} triangles`);
   }
   progress('Simplifying', 0.4);
 
   // ---- global error driven decimation (importance scaled positions)
+  // colour regions of one surface form one piece (shared borders); importance = area weighted
   const pieces = [];
   let voff = 0;
-  parts.forEach((p, i) => {
-    if (!p.F.length) return;
-    const w = weld(p.V, p.F, 1e-5);
-    if (!w.F.length) return;
-    const frac = visArea0[i] / Math.max(totArea[i], 1e-12);
-    const s = CLS_IMPORTANCE[p.cls] * (0.35 + 0.65 * Math.sqrt(frac));
-    const n = w.V.length / 3, c = [0, 0, 0];
-    for (let k = 0; k < n; k++) { c[0] += w.V[3 * k]; c[1] += w.V[3 * k + 1]; c[2] += w.V[3 * k + 2]; }
+  for (const list of splitGroups(parts)) {
+    const live = list.filter((i) => parts[i].F.length);
+    if (!live.length) continue;
+    const m = mergeParts(live.map((i) => parts[i]));
+    if (!m.F.length) continue;
+    let sw = 0, aw = 0;
+    for (const i of live) {
+      const frac = visArea0[i] / Math.max(totArea[i], 1e-12);
+      const a = Math.max(totArea[i], 1e-12);
+      sw += CLS_IMPORTANCE[parts[i].cls] * (0.35 + 0.65 * Math.sqrt(frac)) * a; aw += a;
+    }
+    const sc = sw / aw;
+    const n = m.V.length / 3, c = [0, 0, 0];
+    for (let k = 0; k < n; k++) { c[0] += m.V[3 * k]; c[1] += m.V[3 * k + 1]; c[2] += m.V[3 * k + 2]; }
     c[0] /= n; c[1] /= n; c[2] /= n;
-    const SVp = new Float64Array(w.V.length);
-    for (let k = 0; k < n; k++) for (let j = 0; j < 3; j++) SVp[3 * k + j] = (w.V[3 * k + j] - c[j]) * s + c[j];
-    pieces.push({ part: i, OV: w.V, SV: SVp, F: w.F, voff });
+    const SVp = new Float64Array(m.V.length);
+    for (let k = 0; k < n; k++) for (let j = 0; j < 3; j++) SVp[3 * k + j] = (m.V[3 * k + j] - c[j]) * sc + c[j];
+    pieces.push({ live, m, OV: m.V, SV: SVp, F: m.F, voff });
     voff += n;
-  });
+  }
   const OV = concatF64(pieces.map((q) => q.OV)), SV = concatF64(pieces.map((q) => q.SV));
   const vowner = new Int32Array(voff);
   let gfLen = 0;
@@ -1004,18 +1133,40 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     });
   }
   log(`  global decimation: ${GF.length / 3} -> ${budget} triangles`);
-  const DF = GF.length / 3 > budget ? meshoptSimplify(SV, GF, budget) : GF;
+  let GA = null;
+  if (pieces.some((q) => q.m.attr)) {
+    GA = new Float32Array(voff * 3);
+    for (const q of pieces) {
+      if (q.m.attr) GA.set(q.m.attr, q.voff * 3);
+      else {
+        const c = linToSrgb(parts[q.live[0]].mat.color), l = [0, 0, 0];
+        srgbToOklab(c[0], c[1], c[2], l, 0);
+        for (let v = 0; v < q.OV.length / 3; v++) { GA[3 * (q.voff + v)] = l[0]; GA[3 * (q.voff + v) + 1] = l[1] * 1.6; GA[3 * (q.voff + v) + 2] = l[2] * 1.6; }
+      }
+    }
+  }
+  const DF = GF.length / 3 > budget ? meshoptSimplify(SV, GF, budget, false, GA, REGION_ATTR_WEIGHT) : GF;
   const DV = OV;
   const outParts = [];
   pieces.forEach((q, k) => {
-    const m = new Uint8Array(DF.length / 3);
-    let any = false;
-    for (let f = 0; f < m.length; f++) if (vowner[DF[3 * f]] === k) { m[f] = 1; any = true; }
-    if (!any) return;
-    const sm = subMesh(DV, DF, m);
-    const p = parts[q.part];
-    outParts.push({ name: p.name, cls: p.cls, mat: p.mat, V: sm.V, F: sm.F, twosided: !!p.twosided, texDetail: !!p.texDetail, hiRange: p.hiRange });
+    // this piece's triangles, back in the piece's own vertex numbering
+    const tris = [];
+    for (let f = 0; f < DF.length / 3; f++) if (vowner[DF[3 * f]] === k) tris.push(f);
+    if (!tris.length) return;
+    const Floc = new Uint32Array(tris.length * 3);
+    tris.forEach((f, t) => { for (let j = 0; j < 3; j++) Floc[3 * t + j] = DF[3 * f + j] - q.voff; });
+    const own = q.live.length > 1 ? faceOwners(q.m, Floc) : new Int32Array(tris.length);
+    q.live.forEach((i, kk) => {
+      const mask = new Uint8Array(tris.length);
+      let any = false;
+      for (let t = 0; t < tris.length; t++) if (own[t] === kk) { mask[t] = 1; any = true; }
+      if (!any) return;
+      const sm = subMesh(q.OV, Floc, mask);
+      const p = parts[i];
+      outParts.push({ name: p.name, cls: p.cls, mat: p.mat, V: sm.V, F: sm.F, twosided: !!p.twosided, texDetail: !!p.texDetail, hiRange: p.hiRange, paintKey: p.paintKey });
+    });
   });
+  void DV;
   log(`  after decimation: ${outParts.reduce((s, p) => s + p.F.length / 3, 0)} triangles`);
   progress('Simplifying', 1);
 
@@ -1024,9 +1175,11 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   const FIXED = [CLS.PAINT, CLS.GLASS, CLS.CHROME, CLS.TIRE, CLS.LIGHT_RED, CLS.CARBON];
   for (const p of outParts) {
     const s = linToSrgb(p.mat.color);
-    const key = p.cls === CLS.LIGHT_CLEAR ? `${p.cls}|${isAmber(s)}`
+    const key = p.mat.unlit ? `u${p.cls}|${s.map((v) => Math.round(v * 6)).join(',')}`
+      : p.cls === CLS.PAINT ? `${p.cls}|${p.paintKey && p.paintKey !== 'main' ? s.map((v) => Math.round(v * 6)).join(',') : 'main'}`
+      : p.cls === CLS.LIGHT_CLEAR ? `${p.cls}|${isAmber(s)}`
       : FIXED.includes(p.cls) ? `${p.cls}` : `${p.cls}|${s.map((v) => Math.round(v * 6)).join(',')}`;
-    if (!groups.has(key)) groups.set(key, { cls: p.cls, list: [] });
+    if (!groups.has(key)) groups.set(key, { cls: p.cls, list: [], unlit: !!p.mat.unlit, main: key === `${CLS.PAINT}|main` });
     groups.get(key).list.push(p);
   }
   const maxm = Math.max(1, Math.min(16, maxMaterials));
@@ -1081,7 +1234,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   }
   const allV = [], allN = [], allF = [], mats = [], details = [];
   let vo = 0, to = 0;
-  for (const { cls, list } of groups.values()) {
+  for (const { cls, list, unlit, main } of groups.values()) {
     const j = joinParts(list);
     const cr = cls !== CLS.TIRE ? crease : 60;
     const cn = creaseNormals(j.V, j.F, cr);
@@ -1091,7 +1244,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     const aw = a.map((v) => v + 1e-12), asum = aw.reduce((s, v) => s + v, 0);
     let color = [0, 1, 2].map((c) => list.reduce((s, p, i) => s + p.mat.color[c] * aw[i], 0) / asum);
     const rough = list.reduce((s, p, i) => s + (p.mat.roughness ?? 0.5) * aw[i], 0) / asum;
-    if (cls === CLS.PAINT && paintLin) color = paintLin;
+    if (cls === CLS.PAINT && paintLin && main) color = paintLin;
     allV.push(cn.V); allN.push(Nn);
     const Fo = new Uint32Array(cn.F.length);
     for (let k = 0; k < cn.F.length; k++) Fo[k] = cn.F[k] + vo;
@@ -1100,7 +1253,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     // texture detail: brightness changes inside a colour region go into the per-vertex light
     // factor (the region itself has one colour), so a textured surface keeps its shading
     let detail = null;
-    if (TEX_DETAIL_CLS.includes(cls) && list.some((p) => p.texDetail) && !(cls === CLS.PAINT && paintLin)) {
+    if ((TEX_DETAIL_CLS.includes(cls) || unlit) && list.some((p) => p.texDetail) && !(cls === CLS.PAINT && paintLin && main)) {
       // look the colour up among the source vertices of this material only (a vertex on a
       // region border exists once per region, each with its own colour)
       const idx = [];
@@ -1116,7 +1269,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
       }
       const valid = [...lum].filter((v) => v >= 0).sort((x, y) => x - y);
       if (valid.length > 8) {
-        const ref = valid[Math.floor(valid.length * 0.92)], mean = valid.reduce((s2, v) => s2 + v, 0) / valid.length;
+        const ref = valid[Math.floor(valid.length * 0.8)], mean = valid.reduce((s2, v) => s2 + v, 0) / valid.length;
         if (ref > 1e-4 && mean > 1e-4) {
           detail = new Float64Array(nvg);
           for (let i = 0; i < nvg; i++) detail[i] = lum[i] < 0 ? 1 : Math.min(1, Math.max(0.3, lum[i] / ref));
@@ -1126,8 +1279,8 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
         }
       }
     }
-    details.push(detail);
-    mats.push({ cls, color, rough, triStart: to, triCount: cn.F.length / 3, dsided,
+    details.push({ n: cn.V.length / 3, detail, unlit });
+    mats.push({ cls, color, rough, unlit, triStart: to, triCount: cn.F.length / 3, dsided,
       names: [...new Set(list.map((p) => p.mat.name))].sort() });
     vo += cn.V.length / 3; to += cn.F.length / 3;
   }
@@ -1153,10 +1306,12 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     ao = bakeAO(V, N, F, radius, 128, 512, true, (f) => progress('Baking ambient occlusion', f));
   }
   {
+    // unlit materials (KHR_materials_unlit, light baked into the texture): no AO on top
     let o = 0;
-    details.forEach((d) => {
-      if (d) for (let i = 0; i < d.length; i++) ao[o + i] *= d[i];
-      o += d ? d.length : 0;
+    details.forEach(({ n, detail, unlit }) => {
+      if (unlit) for (let i = 0; i < n; i++) ao[o + i] = 1;
+      if (detail) for (let i = 0; i < n; i++) ao[o + i] *= detail[i];
+      o += n;
     });
   }
 
@@ -1165,7 +1320,7 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   mats.forEach((m, i) => {
     progress('Rendering materials', i / mats.length);
     const size = CLS_MATCAP[m.cls] || 64;
-    const r = renderMatcap(m.cls, m.color, size, m.rough);
+    const r = renderMatcap(m.cls, m.color, size, m.rough, { unlit: m.unlit, object: !cfg._isCar });
     m.matcapSize = size;
     m.rgb565 = r.rgb565;
   });
