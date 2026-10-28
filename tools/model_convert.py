@@ -67,8 +67,8 @@ CLS_IMPORTANCE = {CLS_PAINT: 2.6, CLS_GLASS: 1.1, CLS_CHROME: 1.0, CLS_METAL: 0.
 CLS_MATCAP = {CLS_PAINT: 128, CLS_GLASS: 128, CLS_CHROME: 128}
 
 # classes whose texture brightness detail is kept per vertex
-WHEEL_RX = re.compile(r"wheel|rim|tyre|tire|felg")
-LIVERY_RX = re.compile(r"paint|(?<![a-z])lack")          # a textured paint material = livery
+WHEEL_RX = re.compile(r"wheel|(?<![a-z])rims?(?![a-z])|tyre|tire|felg")
+LIVERY_RX = re.compile(r"paint|(?<![a-z])lack|primary")          # a textured paint material = livery
 TEX_DETAIL_CLS = (CLS_GENERIC, CLS_PLASTIC, CLS_INTERIOR, CLS_PAINT, CLS_LIGHT_RED, CLS_LIGHT_CLEAR)
 
 MAGIC = b"R3DM"
@@ -554,6 +554,15 @@ def apply_texture_split(parts, is_car, max_colors):
         return parts
     if not is_car:
         parts = merge_by_material(parts)
+    # the biggest textured "body" part is the paint even without "paint" in its name
+    biggest_paint, bpa = None, 0.0
+    for p in parts:
+        if p["cls"] != CLS_PAINT or p.get("fcol") is None:
+            continue
+        Vq, Fq = p["V"], p["F"]
+        a = float(np.linalg.norm(np.cross(Vq[Fq[:, 1]] - Vq[Fq[:, 0]], Vq[Fq[:, 2]] - Vq[Fq[:, 0]]), axis=1).sum())
+        if a > bpa:
+            bpa, biggest_paint = a, p
     car_h = max(float(p["V"][:, 1].max()) for p in parts if len(p["V"])) if is_car else 1.0
     out = []
     for p in parts:
@@ -564,7 +573,7 @@ def apply_texture_split(parts, is_car, max_colors):
                 mode = "object"
             elif p["cls"] in (CLS_LIGHT_RED, CLS_LIGHT_CLEAR):
                 mode = "light"
-            elif p["cls"] == CLS_PAINT and p.get("paint_by_name"):           # livery
+            elif p["cls"] == CLS_PAINT and (p.get("paint_by_name") or p is biggest_paint):   # livery
                 mode = "paint" if _is_atlas(fcol, len(p["F"]), 300) else None
             elif p["cls"] == CLS_METAL and WHEEL_RX.search((p["mat"]["name"] + " " + p["name"]).lower()):
                 mode = "wheel" if _is_atlas(fcol, len(p["F"]), 300) else None   # rim + tyre texture
@@ -603,7 +612,12 @@ def apply_texture_split(parts, is_car, max_colors):
                 pieces = [(fm, CLS_PLASTIC if lum < 0.02 else CLS_GENERIC, c)]
             elif mode == "light":
                 cls, col = light_region_class(c, cx)
-                pieces = [(fm, cls, col)]
+                if is_car and float(np.dot(c, [0.2126, 0.7152, 0.0722])) < 0.3 and float(np.ptp(c)) < 0.15:
+                    # a window in the lamp material ("lights and glass" texture): high faces = glass
+                    high = cen[:, 1] > 0.6 * car_h
+                    pieces = [(fm & high, CLS_GLASS, c), (fm & ~high, cls, col)]
+                else:
+                    pieces = [(fm, cls, col)]
             elif mode == "paint":
                 pieces = [(fm, CLS_PAINT, c)]
             elif mode == "wheel":
@@ -649,8 +663,8 @@ RULES = [
     (CLS_CHROME, r"chrome|chrom|mirror_refl|polished"),
     (CLS_TIRE, r"tire|tyre|rubber|reifen|opon|guma|llanta"),
     (CLS_CARBON, r"carbon"),
-    (CLS_METAL, r"rim|wheel|alloy|felge|disc|disk|brake|caliper|metal|steel|alu|exhaust|felg"),
-    (CLS_PAINT, r"paint|body|carpaint|car_paint|(?<![a-z])lack|karoser|exterior|coat"),
+    (CLS_METAL, r"(?<![a-z])rims?(?![a-z])|wheel|alloy|felge|disc|disk|brake|caliper|metal|steel|(?<![a-z])alu|exhaust|felg"),
+    (CLS_PAINT, r"paint|body|carpaint|car_paint|(?<![a-z])lack|karoser|exterior|coat|primary"),
     (CLS_PLASTIC, r"plastic|trim|black|grill|grille|bumper_low|matte|kunststoff"),
 ]
 
@@ -658,6 +672,12 @@ RULES = [
 def classify(part):
     name = (part["mat"]["name"] + " " + part["name"]).lower()
     mi = part["mat"]
+    # the part's own name (without the material name it often carries) says window: glass,
+    # even when the material is a shared "lights and glass" one
+    mn = part["mat"]["name"].lower()
+    own = " ".join(part["name"].lower().split(mn)) if len(mn) >= 3 else part["name"].lower()
+    if re.search(r"window|windshield|windscreen|glass|scheibe|szyb", own) and not re.search(r"light|lamp|led|lens|mirror", own):
+        return CLS_GLASS
     for cls, rx in RULES:
         if re.search(rx, name):
             # coloured "lens" materials: decide by hue
@@ -1210,10 +1230,32 @@ def normalise_orientation(parts, cfg):
     ext = V.max(0) - V.min(0)
     Lh, Wh = max(ext[0], ext[2]), min(ext[0], ext[2])
     car_shape = Wh > 0 and ext[1] > 0 and 1.5 <= Lh / Wh <= 3.4 and 1.7 <= Lh / ext[1] <= 4.5
+    # wheels: round-ish parts standing on the ground, two at each end
+    wheels, ends = 0, set()
+    if car_shape:
+        mn_r, mx_r = V.min(0), V.max(0)
+        along_x = ext[0] >= ext[2]
+        for p in live:
+            Pv = p["mesh"].vertices @ R.T
+            a, b = Pv.min(0), Pv.max(0)
+            h = b[1] - a[1]
+            ln, th = ((b[0] - a[0]), (b[2] - a[2])) if along_x else ((b[2] - a[2]), (b[0] - a[0]))
+            if a[1] > mn_r[1] + 0.06 * ext[1] or not (0.18 * ext[1] <= h <= 0.6 * ext[1]):
+                continue
+            if not (0.7 * h <= ln <= 1.4 * h) or th > 0.75 * h:
+                continue
+            k = 0 if along_x else 2
+            c = (a[k] + b[k]) / 2 - (mn_r[k] + mx_r[k]) / 2
+            if abs(c) < 0.25 * Lh:
+                continue
+            wheels += 1
+            ends.add(c > 0)
+        if len(ends) < 2:
+            wheels = 0
     is_car = cfg.get("kind", "auto") == "car" or (
         cfg.get("kind", "auto") == "auto" and
         (any(p["cls"] in (CLS_TIRE, CLS_LIGHT_RED, CLS_LIGHT_CLEAR) for p in live) or
-         (car_shape and any(p["cls"] == CLS_PAINT for p in live))))
+         (car_shape and (wheels >= 3 or any(p["cls"] == CLS_PAINT for p in live)))))
     cfg["_is_car"] = is_car
     if not is_car:
         # generic object (figure, toy, ...): glTF convention, front faces +Z -> viewer front +X
@@ -1371,15 +1413,19 @@ def convert(args):
     if cfg.get("_is_car", True) and not any(k.lower() in overrides for k in
                                             {p["mat"]["name"] for p in parts if p["cls"] == CLS_PAINT}):
         score = {}
+        high_f = V[F].mean(1)[:, 1] > 0.3 * V[:, 1].max()
         for i, p in enumerate(parts):
             if p["cls"] not in (CLS_GENERIC, CLS_PLASTIC, CLS_PAINT) or (p.get("from_split") and not p.get("paint_src")):
                 continue
-            a = areas[(owner == i) & vis].sum()
+            # only surface above the sills counts (the underbody is big but never the paint)
+            a = areas[(owner == i) & vis & high_f].sum()
             srgb = linear_to_srgb(p["mat"]["color"])
             sat = float(np.ptp(srgb))
             sc = a * (0.25 + 1.5 * sat) * 0.5
             if p["cls"] == CLS_PAINT:
                 sc *= 1.5
+            if LIVERY_RX.search((p["mat"]["name"] + " " + p["name"]).lower()):
+                sc *= 2.5                                   # "paint", "primary"
             k = p.get("paint_src") or p["mat"]["name"]       # a livery competes with all its regions
             score[k] = score.get(k, 0.0) + sc
         if score:

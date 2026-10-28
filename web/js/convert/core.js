@@ -18,8 +18,8 @@ const CLS_IMPORTANCE = {
   [CLS.PLASTIC]: 0.55, [CLS.LIGHT_RED]: 1.1, [CLS.LIGHT_CLEAR]: 1.2, [CLS.INTERIOR]: 0.3,
   [CLS.CARBON]: 0.8, [CLS.GENERIC]: 0.9,
 };
-const WHEEL_RX = /wheel|rim|tyre|tire|felg/;
-const LIVERY_RX = /paint|(?<![a-z])lack/;            // a textured paint material = livery
+const WHEEL_RX = /wheel|(?<![a-z])rims?(?![a-z])|tyre|tire|felg/;
+const LIVERY_RX = /paint|(?<![a-z])lack|primary/;            // a textured paint material = livery
 let splitCounter = 0;
 const TEX_DETAIL_CLS = [CLS.GENERIC, CLS.PLASTIC, CLS.INTERIOR, CLS.PAINT, CLS.LIGHT_RED, CLS.LIGHT_CLEAR];
 
@@ -60,14 +60,19 @@ const RULES = [
   [CLS.CHROME, /chrome|chrom|mirror_refl|polished/],
   [CLS.TIRE, /tire|tyre|rubber|reifen|opon|guma|llanta/],
   [CLS.CARBON, /carbon/],
-  [CLS.METAL, /rim|wheel|alloy|felge|disc|disk|brake|caliper|metal|steel|alu|exhaust|felg/],
-  [CLS.PAINT, /paint|body|carpaint|car_paint|(?<![a-z])lack|karoser|exterior|coat/],
+  [CLS.METAL, /(?<![a-z])rims?(?![a-z])|wheel|alloy|felge|disc|disk|brake|caliper|metal|steel|(?<![a-z])alu|exhaust|felg/],
+  [CLS.PAINT, /paint|body|carpaint|car_paint|(?<![a-z])lack|karoser|exterior|coat|primary/],
   [CLS.PLASTIC, /plastic|trim|black|grill|grille|bumper_low|matte|kunststoff/],
 ];
 
 export function classify(part) {
   const name = (part.mat.name + ' ' + part.name).toLowerCase();
   const mi = part.mat;
+  // the part's own name (without the material name it often carries) says window: glass,
+  // even when the material is a shared "lights and glass" one
+  const mn = part.mat.name.toLowerCase();
+  const own = mn.length >= 3 ? part.name.toLowerCase().split(mn).join(' ') : part.name.toLowerCase();
+  if (/window|windshield|windscreen|glass|scheibe|szyb/.test(own) && !/light|lamp|led|lens|mirror/.test(own)) return CLS.GLASS;
   for (const [cls, rx] of RULES) {
     if (rx.test(name)) {
       if ((cls === CLS.LIGHT_CLEAR || cls === CLS.GLASS) && isReddish(linToSrgb(mi.color))) return CLS.LIGHT_RED;
@@ -337,6 +342,13 @@ function mergeByMaterial(parts) {
 function applyTextureSplit(parts, isCar, maxColors, log) {
   if (maxColors <= 1) return parts;
   if (!isCar) parts = mergeByMaterial(parts);
+  // the biggest textured "body" part is the paint even without "paint" in its name
+  let biggestPaint = null, bpa = 0;
+  for (const p of parts) {
+    if (p.cls !== CLS.PAINT || !p.faceCol) continue;
+    const a = faceAreas(p.V, p.F).reduce((x, y) => x + y, 0);
+    if (a > bpa) { bpa = a; biggestPaint = p; }
+  }
   let carH = 1;
   if (isCar) {
     carH = -Infinity;
@@ -348,7 +360,8 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
     if (p.faceCol) {
       if (!isCar) mode = 'object';
       else if (p.cls === CLS.LIGHT_RED || p.cls === CLS.LIGHT_CLEAR) mode = 'light';
-      else if (p.cls === CLS.PAINT && p.paintByName) mode = isAtlas(p, 300) ? 'paint' : null;   // livery
+      else if (p.cls === CLS.PAINT && (p.paintByName || p === biggestPaint))
+        mode = isAtlas(p, 300) ? 'paint' : null;                            // livery
       else if (p.cls === CLS.METAL && WHEEL_RX.test((p.mat.name + ' ' + p.name).toLowerCase()))
         mode = isAtlas(p, 300) ? 'wheel' : null;                             // rim + tyre in one texture
       else if ([CLS.GENERIC, CLS.PLASTIC, CLS.PAINT, CLS.INTERIOR].includes(p.cls)) mode = isAtlas(p) ? 'atlas' : null;
@@ -383,17 +396,23 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
     }
     colors.forEach((c, r) => {
       const fm = new Uint8Array(nf);
-      let n = 0, sx = 0;
-      for (let f = 0; f < nf; f++) if (lbl[f] === r) { fm[f] = 1; n++; sx += cen[3 * f]; }
+      let n = 0, sx = 0, sy = 0;
+      for (let f = 0; f < nf; f++) if (lbl[f] === r) { fm[f] = 1; n++; sx += cen[3 * f]; sy += cen[3 * f + 1]; }
       if (!n) return;
-      const cx = sx / n;
+      const cx = sx / n, cy = sy / n;
       let pieces;
       if (mode === 'object') {
         const lum = dot3(srgbToLin(c), LUM);
         pieces = [[fm, lum < 0.02 ? CLS.PLASTIC : CLS.GENERIC, c]];
       } else if (mode === 'light') {
+        // a window in the lamp material (one "lights and glass" texture): above the window
+        // line, dark and neutral -> glass
         const [cls, col] = lightRegionClass(c, cx);
-        pieces = [[fm, cls, col]];
+        if (isCar && dot3(c, LUM) < 0.3 && ptp3(c) < 0.15) {
+          const hi = new Uint8Array(nf), lo = new Uint8Array(nf);
+          for (let f = 0; f < nf; f++) if (fm[f]) { if (cen[3 * f + 1] > 0.6 * carH) hi[f] = 1; else lo[f] = 1; }
+          pieces = [[hi, CLS.GLASS, c], [lo, cls, col]];
+        } else pieces = [[fm, cls, col]];
       } else if (mode === 'paint') {
         pieces = [[fm, CLS.PAINT, c]];
       } else if (mode === 'wheel') {
@@ -682,8 +701,24 @@ function normaliseOrientation(parts, cfg) {
   const Lh = Math.max(ext[0], ext[2]), Wh = Math.min(ext[0], ext[2]);
   const carShape = Wh > 0 && ext[1] > 0 && Lh / Wh >= 1.5 && Lh / Wh <= 3.4 && Lh / ext[1] >= 1.7 && Lh / ext[1] <= 4.5;
   const live = parts.filter((p) => p.cls !== CLS_DROP);
+  // wheels: round-ish parts standing on the ground, two at each end
+  let wheels = 0;
+  if (carShape) {
+    const H = ext[1], alongX = ext[0] >= ext[2], ends = new Set();
+    for (const p of live) {
+      const [a, b] = bounds(R, p);
+      const h = b[1] - a[1], ex = b[0] - a[0], ez = b[2] - a[2];
+      const len = alongX ? ex : ez, thick = alongX ? ez : ex;
+      if (a[1] > mn[1] + 0.06 * H || h < 0.18 * H || h > 0.6 * H) continue;
+      if (len < 0.7 * h || len > 1.4 * h || thick > 0.75 * h) continue;
+      const c = alongX ? (a[0] + b[0]) / 2 - (mn[0] + mx[0]) / 2 : (a[2] + b[2]) / 2 - (mn[2] + mx[2]) / 2;
+      if (Math.abs(c) < 0.25 * Lh) continue;
+      wheels++; ends.add(c > 0);
+    }
+    if (ends.size < 2) wheels = 0;
+  }
   const isCar = kind === 'car' || (kind === 'auto' && (live.some((p) => [CLS.TIRE, CLS.LIGHT_RED, CLS.LIGHT_CLEAR].includes(p.cls))
-    || (carShape && live.some((p) => p.cls === CLS.PAINT))));
+    || (carShape && (wheels >= 3 || live.some((p) => p.cls === CLS.PAINT)))));
   cfg._isCar = isCar;
   if (!isCar) R = matMul(rotY(90), R);
   else if (ext[2] > ext[0]) R = matMul(rotY(-90), R);
@@ -722,11 +757,11 @@ function normaliseOrientation(parts, cfg) {
 // --------------------------------------------------------------------------------------
 // mesh processing
 // --------------------------------------------------------------------------------------
-function meshoptSimplify(V, F, target, lockBorder = false, attr = null, attrWeight = 0) {
+function meshoptSimplify(V, F, target, lockBorder = false, attr = null, attrWeight = 0, extraFlags = []) {
   const pos = new Float32Array(V);
   const idx = F instanceof Uint32Array ? F : new Uint32Array(F);
   const tic = Math.min(idx.length, Math.max(0, Math.floor(target)) * 3);
-  const flags = lockBorder ? ['LockBorder'] : [];
+  const flags = (lockBorder ? ['LockBorder'] : []).concat(extraFlags);
   // attr: per-vertex region colour; borders between colour regions are kept where possible
   const [out] = attr
     ? MeshoptSimplifier.simplifyWithAttributes(idx, pos, 3, attr, 3, [attrWeight, attrWeight, attrWeight], null, tic, 1.0, flags)
@@ -1038,14 +1073,22 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   const paintMatNames = new Set(parts.filter((p) => p.cls === CLS.PAINT).map((p) => p.mat.name.toLowerCase()));
   if (cfg._isCar && ![...paintMatNames].some((k) => k in overrides)) {
     // a paint material with a livery competes with its colour regions (paintSrc)
-    const visArea = new Float64Array(parts.length);
-    for (let f = 0; f < nf; f++) if (vis[f]) visArea[owner[f]] += areas[f];
+    const visHigh = new Float64Array(parts.length);
+    let yTop = 0;
+    for (let i = 1; i < V.length; i += 3) yTop = Math.max(yTop, V[i]);
+    for (let f = 0; f < nf; f++) {
+      if (!vis[f]) continue;
+      const cy = (V[3 * F[3 * f] + 1] + V[3 * F[3 * f + 1] + 1] + V[3 * F[3 * f + 2] + 1]) / 3;
+      if (cy > 0.3 * yTop) visHigh[owner[f]] += areas[f];
+    }
     const score = new Map();
     parts.forEach((p, i) => {
       if (![CLS.GENERIC, CLS.PLASTIC, CLS.PAINT].includes(p.cls) || (p.fromSplit && !p.paintSplit)) return;
       const sat = ptp3(linToSrgb(p.mat.color));
-      let sc = visArea[i] * (0.25 + 1.5 * sat) * 0.5;
+      // only surface above the sills counts (the underbody is big but never the paint)
+      let sc = visHigh[i] * (0.25 + 1.5 * sat) * 0.5;
       if (p.cls === CLS.PAINT) sc *= 1.5;
+      if (LIVERY_RX.test((p.mat.name + ' ' + p.name).toLowerCase())) sc *= 2.5;      // "paint", "primary"
       const k = p.paintSrc || p.mat.name;
       score.set(k, (score.get(k) || 0) + sc);
     });
@@ -1145,7 +1188,14 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
       }
     }
   }
-  const DF = GF.length / 3 > budget ? meshoptSimplify(SV, GF, budget, false, GA, REGION_ATTR_WEIGHT) : GF;
+  let DF = GF.length / 3 > budget ? meshoptSimplify(SV, GF, budget, false, GA, REGION_ATTR_WEIGHT) : GF;
+  if (DF.length / 3 > budget * 1.1) {
+    // some topologies (thin closed shells, tyre treads) block the normal edge collapses:
+    // the permissive mode allows them
+    const before = DF.length / 3;
+    DF = meshoptSimplify(SV, GF, budget, false, GA, REGION_ATTR_WEIGHT, ['Permissive']);
+    log(`  simplifier stopped at ${before} triangles, permissive mode: ${DF.length / 3}`);
+  }
   const DV = OV;
   const outParts = [];
   pieces.forEach((q, k) => {
