@@ -19,6 +19,7 @@ const CLS_IMPORTANCE = {
   [CLS.CARBON]: 0.8, [CLS.GENERIC]: 0.9,
 };
 const WHEEL_RX = /wheel|(?<![a-z])rims?(?![a-z])|tyre|tire|felg/;
+const BODYCOL_RX = /(?<![a-z])colou?red(?![a-z])|body.?colou?r/;
 const LIVERY_RX = /paint|(?<![a-z])lack|primary/;            // a textured paint material = livery
 let splitCounter = 0;
 const TEX_DETAIL_CLS = [CLS.GENERIC, CLS.PLASTIC, CLS.INTERIOR, CLS.PAINT, CLS.LIGHT_RED, CLS.LIGHT_CLEAR];
@@ -52,11 +53,11 @@ const isRed = (c) => c[0] > 0.15 && c[0] > 1.8 * c[1] && (c[2] > 0.4 * c[1] || c
 // classification by names / PBR values
 // --------------------------------------------------------------------------------------
 const RULES = [
-  [CLS.METAL, /hub|disk|disc|caliper|felge|(?<![a-z])rims?(?![a-z])|brake(?!.*(light|lamp|led|lens))/],
+  [CLS.METAL, /hub|disk|disc|caliper|felge|(?<![a-z])rims?(?![a-z])|brake(?!.*(light|lamp|(?<![a-z])leds?(?![a-z])|lens))/],
   [CLS.INTERIOR, /interior|leather|seat|carpet|dashboard|dash|steering|cockpit|fabric|alcantara|inner|innen/],
-  [CLS.LIGHT_RED, /(tail|brake|stop).*(light|lamp|led|lens)|(rear|back).*(light|lamp|led)|(light|lamp|led|lens)[ _-]?red|red[ _-]?(light|lamp|led|lens)|rueckleucht|tylne|taillight/],
-  [CLS.LIGHT_CLEAR, /head.?light|headlamp|projector|front.?light|lamp|lens|light|led|indicator|turn.?signal|reflector|scheinwerfer|reflektor/],
-  [CLS.GLASS, /glass|window|windshield|windscreen|scheibe|szyb|glas/],
+  [CLS.LIGHT_RED, /(tail|brake|stop).*(light|lamp|(?<![a-z])leds?(?![a-z])|lens)|(rear|back).*(light|lamp|(?<![a-z])leds?(?![a-z]))|(light|lamp|(?<![a-z])leds?(?![a-z])|lens)[ _-]?red|red[ _-]?(light|lamp|(?<![a-z])leds?(?![a-z])|lens)|rueckleucht|tylne|taillight/],
+  [CLS.LIGHT_CLEAR, /head.?light|headlamp|projector|front.?light|lamp|lens|light|(?<![a-z])leds?(?![a-z])|indicator|turn.?signal|reflector|scheinwerfer|reflektor/],
+  [CLS.GLASS, /glass|window|windshield|windscreen|scheibe|szyb|glas|cristal|crystal|vidrio|verre|vitre|vetro|szkl/],
   [CLS.CHROME, /chrome|chrom|mirror_refl|polished/],
   [CLS.TIRE, /tire|tyre|rubber|reifen|opon|guma|llanta/],
   [CLS.CARBON, /carbon/],
@@ -72,7 +73,7 @@ export function classify(part) {
   // even when the material is a shared "lights and glass" one
   const mn = part.mat.name.toLowerCase();
   const own = mn.length >= 3 ? part.name.toLowerCase().split(mn).join(' ') : part.name.toLowerCase();
-  if (/window|windshield|windscreen|glass|scheibe|szyb/.test(own) && !/light|lamp|led|lens|mirror/.test(own)) return CLS.GLASS;
+  if (/window|windshield|windscreen|glass|scheibe|szyb/.test(own) && !/light|lamp|(?<![a-z])leds?(?![a-z])|lens|mirror/.test(own)) return CLS.GLASS;
   for (const [cls, rx] of RULES) {
     if (rx.test(name)) {
       if ((cls === CLS.LIGHT_CLEAR || cls === CLS.GLASS) && isReddish(linToSrgb(mi.color))) return CLS.LIGHT_RED;
@@ -357,7 +358,9 @@ function applyTextureSplit(parts, isCar, maxColors, log) {
   const out = [];
   for (const p of parts) {
     let mode = null;
-    if (p.faceCol) {
+    if (p.faceCol && isCar && BODYCOL_RX.test((p.mat.name + ' ' + p.name).toLowerCase())) {
+      // body-colour tint mask: painted later, never split
+    } else if (p.faceCol) {
       if (!isCar) mode = 'object';
       else if (p.cls === CLS.LIGHT_RED || p.cls === CLS.LIGHT_CLEAR) mode = 'light';
       else if (p.cls === CLS.PAINT && (p.paintByName || (biggestPaint && p.mat.name === biggestPaint.mat.name)))
@@ -484,17 +487,23 @@ function dropLampCovers(parts, log, dist = 0.05) {
   let dropped = 0;
   for (const p of parts) {
     if (p.cls !== CLS.GLASS || !p.F.length) { out.push(p); continue; }
-    const nf = p.F.length / 3, keep = new Uint8Array(nf);
-    let nk = 0;
+    const nf = p.F.length / 3, keep = new Uint8Array(nf), near = new Uint8Array(nf), high = new Uint8Array(nf);
+    let nk = 0, nnear = 0;
     for (let f = 0; f < nf; f++) {
       const x = (p.V[3 * p.F[3 * f]] + p.V[3 * p.F[3 * f + 1]] + p.V[3 * p.F[3 * f + 2]]) / 3;
       const y = (p.V[3 * p.F[3 * f] + 1] + p.V[3 * p.F[3 * f + 1] + 1] + p.V[3 * p.F[3 * f + 2] + 1]) / 3;
       const z = (p.V[3 * p.F[3 * f] + 2] + p.V[3 * p.F[3 * f + 1] + 2] + p.V[3 * p.F[3 * f + 2] + 2]) / 3;
-      let k = 1;
-      if (Math.abs(x) > 0.5 && y < 0.6 * carH) k = 0;
-      else if (grid) { grid.nearest(x, y, z, dist); if (!(grid.lastDist > dist)) k = 0; }
-      keep[f] = k;
-      nk += k;
+      keep[f] = !(Math.abs(x) > 0.5 && y < 0.6 * carH);
+      high[f] = y >= 0.6 * carH;
+      if (grid) { grid.nearest(x, y, z, dist); if (!(grid.lastDist > dist)) { near[f] = 1; nnear++; } }
+    }
+    // glass next to a lamp is its lens - except a window passing a lamp at window height
+    // (third brake light above / below the rear window): only a glass part that is mostly
+    // lamp lens loses its faces up there
+    const lens = nnear > 0.5 * nf;
+    for (let f = 0; f < nf; f++) {
+      if (near[f] && (!high[f] || lens)) keep[f] = 0;
+      nk += keep[f];
     }
     dropped += nf - nk;
     if (nk === nf) { out.push(p); continue; }
@@ -974,15 +983,25 @@ function outwardNormals(V, N, yMid) {
 // faces within NORMAL_FILTER_R that face the same way (< 50 deg). Panel gaps, rivets and other
 // detail the simplified mesh can not show no longer bend the vertex normals, so doors and
 // bonnets reflect evenly instead of showing smears and dents.
-const NORMAL_FILTER_R = 0.012;
-function filteredNormals(V, N, hf) {
+const NORMAL_FILTER_R = 0.03;
+const GLASS_LIFT = 0.004;
+// Only visible source faces of the same material group count: interior parts, the inner
+// layer of a window or a neighbouring panel of another material lying within the radius
+// must not bend the normal. Thin sheets (glass) take faces of either orientation.
+function filteredNormals(V, N, hf, list, sheet) {
   const n = V.length / 3, out = new Float64Array(N.length), cosT = Math.cos(50 * Math.PI / 180);
+  const starts = new Set(list.map((p) => p.hiRange && p.hiRange[0]));
+  const ok = new Uint8Array(hf.start.length);
+  hf.start.forEach((st, k) => { if (starts.has(st)) ok[k] = 1; });
   for (let i = 0; i < n; i++) {
     const nx = N[3 * i], ny = N[3 * i + 1], nz = N[3 * i + 2];
     let ax = 0, ay = 0, az = 0, cnt = 0;
     hf.grid.within(V[3 * i], V[3 * i + 1], V[3 * i + 2], NORMAL_FILTER_R, (f) => {
-      const fx = hf.N[3 * f], fy = hf.N[3 * f + 1], fz = hf.N[3 * f + 2];
-      if (fx * nx + fy * ny + fz * nz < cosT) return;
+      if (!ok[hf.own[f]] || !hf.vis[f]) return;
+      let fx = hf.N[3 * f], fy = hf.N[3 * f + 1], fz = hf.N[3 * f + 2];
+      let d = fx * nx + fy * ny + fz * nz;
+      if (sheet && d < 0) { fx = -fx; fy = -fy; fz = -fz; d = -d; }
+      if (d < cosT) return;
       const w = hf.A[f];
       ax += fx * w; ay += fy * w; az += fz * w; cnt++;
     });
@@ -1086,6 +1105,12 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     p.V = w.V; p.F = Fd; p.faceCol = null;
   }
   parts = parts.filter((p) => p.F.length);
+  if (opts.debugParts) for (const p of parts) {
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (let i = 0; i < p.V.length; i += 3) { x0 = Math.min(x0, p.V[i]); x1 = Math.max(x1, p.V[i]); y0 = Math.min(y0, p.V[i + 1]); y1 = Math.max(y1, p.V[i + 1]); z0 = Math.min(z0, p.V[i + 2]); z1 = Math.max(z1, p.V[i + 2]); }
+    const c = linToSrgb(p.mat.color).map((v) => v.toFixed(2)).join(',');
+    log(`  part ${CLS_NAMES[p.cls]} ${p.F.length / 3} [${c}] x ${x0.toFixed(2)}..${x1.toFixed(2)} y ${y0.toFixed(2)}..${y1.toFixed(2)} z ${z0.toFixed(2)}..${z1.toFixed(2)} ${p.name} | ${p.mat.name}`);
+  }
   if (ndup) log(`  removed ${ndup} duplicate (double-sided) triangles`);
 
   // ---- global arrays
@@ -1104,6 +1129,8 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
 
   // ---- hidden surface removal
   let vis;
+  const hiFlip = new Uint8Array(nf);
+  let nhFlip = 0;
   if (!opts.keepHidden) {
     progress('Removing hidden geometry', 0);
     log(`  visibility: ${nf} tris, ${nViews} views @ 640px`);
@@ -1112,8 +1139,29 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     const { labels, count } = faceComponents(F, V.length / 3);
     const score = new Float64Array(count);
     for (let f = 0; f < nf; f++) score[labels[f]] += r.back[f] - r.front[f];
+    // whole connected pieces turn by majority. Inside a piece whose winding the per-part fix
+    // could not make consistent (a mirrored panel welded to its neighbour), a larger patch of
+    // faces seen clearly from behind is wound the wrong way: on the device it would be
+    // back-face culled and show what lies behind it. Such patches are turned only in the final
+    // mesh (hiFlip): turning them before simplification would leave edges where the winding
+    // disagrees, which the simplifier treats as borders and can not collapse.
+    const flipF = new Uint8Array(nf), cand = new Uint8Array(nf);
+    for (let f = 0; f < nf; f++) {
+      flipF[f] = score[labels[f]] > 0 ? 1 : 0;
+      const fr = flipF[f] ? r.back[f] : r.front[f], bk = flipF[f] ? r.front[f] : r.back[f];
+      cand[f] = bk >= 4 && bk > 6 * fr ? 1 : 0;
+    }
+    {
+      const adj = faceAdjacency(F, V.length / 3), uf = new UnionFind(nf);
+      for (let i = 0; i < adj.length; i += 2) if (cand[adj[i]] && cand[adj[i + 1]]) uf.union(adj[i], adj[i + 1]);
+      const sz = new Int32Array(nf);
+      for (let f = 0; f < nf; f++) if (cand[f]) sz[uf.find(f)]++;
+      let nh = 0;
+      for (let f = 0; f < nf; f++) if (cand[f] && sz[uf.find(f)] >= 16) { hiFlip[f] = 1; nh++; nhFlip++; }
+      if (nh) log(`  ${nh} triangles seen from behind: turned in the final mesh`);
+    }
     let nflip = 0;
-    for (let f = 0; f < nf; f++) if (score[labels[f]] > 0) {
+    for (let f = 0; f < nf; f++) if (flipF[f]) {
       const t = F[3 * f + 1]; F[3 * f + 1] = F[3 * f + 2]; F[3 * f + 2] = t; nflip++;
     }
     const vcnt = new Float64Array(parts.length), tcnt = new Float64Array(parts.length);
@@ -1138,7 +1186,8 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
     const a = 3 * F[3 * f], b = 3 * F[3 * f + 1], c = 3 * F[3 * f + 2];
     const ux = V[b] - V[a], uy = V[b + 1] - V[a + 1], uz = V[b + 2] - V[a + 2];
     const vx = V[c] - V[a], vy = V[c + 1] - V[a + 1], vz = V[c + 2] - V[a + 2];
-    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const sg = hiFlip[f] ? -1 : 1;
+    const nx = sg * (uy * vz - uz * vy), ny = sg * (uz * vx - ux * vz), nz = sg * (ux * vy - uy * vx);
     for (const i of [a, b, c]) { hiN[i] += nx; hiN[i + 1] += ny; hiN[i + 2] += nz; }
   }
   for (let i = 0; i < hiN.length; i += 3) {
@@ -1154,11 +1203,12 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
       const ux = V[b] - V[a], uy = V[b + 1] - V[a + 1], uz = V[b + 2] - V[a + 2];
       const vx = V[c] - V[a], vy = V[c + 1] - V[a + 1], vz = V[c + 2] - V[a + 2];
       const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-      const l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1e-20;
-      Nf[3 * f] = nx / l; Nf[3 * f + 1] = ny / l; Nf[3 * f + 2] = nz / l; A[f] = l;
+      const l = (Math.sqrt(nx * nx + ny * ny + nz * nz) || 1e-20) * (hiFlip[f] ? -1 : 1);
+      Nf[3 * f] = nx / l; Nf[3 * f + 1] = ny / l; Nf[3 * f + 2] = nz / l; A[f] = Math.abs(l);
       for (let k = 0; k < 3; k++) C[3 * f + k] = (V[a + k] + V[b + k] + V[c + k]) / 3;
     }
-    return { C, N: Nf, A, grid: new PointGrid(C, NORMAL_FILTER_R) };
+    // per face: the part it belongs to (its first vertex index identifies it), visible or not
+    return { C, N: Nf, A, own: owner.slice(), vis, start: parts.map((q) => q.hiRange[0]), grid: new PointGrid(C, NORMAL_FILTER_R) };
   })();
 
   const areas = faceAreas(V, F);
@@ -1174,6 +1224,8 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
       const cy = (V[3 * F[3 * f] + 1] + V[3 * F[3 * f + 1] + 1] + V[3 * F[3 * f + 2] + 1]) / 3;
       if (cy > 0.3 * yTop) visHigh[owner[f]] += areas[f];
     }
+    const visArea0p = new Float64Array(parts.length);
+    for (let f = 0; f < nf; f++) if (vis[f]) visArea0p[owner[f]] += areas[f];
     const score = new Map();
     parts.forEach((p, i) => {
       if (![CLS.GENERIC, CLS.PLASTIC, CLS.PAINT].includes(p.cls) || (p.fromSplit && !p.paintSplit)) return;
@@ -1196,6 +1248,22 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
         }
       }
       log(`  paint: material '${mname}'${parts.some((p) => p.paintSrc === mname) ? ' (with livery)' : ''}`);
+      // "Coloured" / "body colour" materials are tinted with the paint colour at run time (game
+      // asset convention); their own base colour is a neutral grey that would show as dark
+      // patches on the bodywork
+      let ref = null, ra = 0;
+      parts.forEach((p, i) => {
+        if (p.cls === CLS.PAINT && (p.paintSrc || p.mat.name) === mname && (!p.paintKey || p.paintKey === 'main') && visArea0p[i] > ra) { ra = visArea0p[i]; ref = p; }
+      });
+      let nbc = 0;
+      if (ref) for (const p of parts) {
+        if (p.fromSplit || p === ref || ![CLS.METAL, CLS.GENERIC, CLS.PLASTIC, CLS.PAINT].includes(p.cls)) continue;
+        if (!BODYCOL_RX.test((p.mat.name + ' ' + p.name).toLowerCase())) continue;
+        p.cls = CLS.PAINT; p.paintKey = 'main'; p.mat = { ...p.mat, color: ref.mat.color.slice() }; nbc++;
+        // its texture is the tint mask, not shading: no texture detail
+        p.texDetail = false; hiCol.fill(-1, 3 * p.hiRange[0], 3 * (p.hiRange[0] + p.hiRange[1]));
+      }
+      if (nbc) log(`  body-colour parts painted: ${nbc}`);
     }
   }
 
@@ -1379,16 +1447,36 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   let vo = 0, to = 0;
   for (const { cls, list, unlit, main } of groups.values()) {
     const j = joinParts(list);
+    // (double sided materials and glass are drawn from both sides anyway)
+    if (nhFlip && cls !== CLS.GLASS && !list.some((p) => p.twosided)) {   // faces over source patches seen from behind turn here
+      const starts = new Set(list.map((p) => p.hiRange && p.hiRange[0]));
+      const ok = new Uint8Array(hiFace.start.length);
+      hiFace.start.forEach((st, k) => { if (starts.has(st)) ok[k] = 1; });
+      for (let f = 0; f < j.F.length / 3; f++) {
+        let x = 0, y = 0, z = 0;
+        for (let k = 0; k < 3; k++) { const v = 3 * j.F[3 * f + k]; x += j.V[v] / 3; y += j.V[v + 1] / 3; z += j.V[v + 2] / 3; }
+        let best = -1, bd = Infinity;
+        hiFace.grid.within(x, y, z, NORMAL_FILTER_R, (q) => {
+          if (!ok[hiFace.own[q]] || !hiFace.vis[q]) return;
+          const dx = hiFace.C[3 * q] - x, dy = hiFace.C[3 * q + 1] - y, dz = hiFace.C[3 * q + 2] - z, d = dx * dx + dy * dy + dz * dz;
+          if (d < bd) { bd = d; best = q; }
+        });
+        if (best >= 0 && hiFlip[best]) { const t = j.F[3 * f + 1]; j.F[3 * f + 1] = j.F[3 * f + 2]; j.F[3 * f + 2] = t; }
+      }
+    }
     const cr = cls !== CLS.TIRE ? crease : 60;
     const cn = creaseNormals(j.V, j.F, cr);
     const Nt = transferNormals(cn.V, cn.N, hiGrid, hiN);
     if (cls === CLS.GLASS) outwardNormals(cn.V, Nt, yMid);
-    const Nn = cls === CLS.TIRE ? Nt : filteredNormals(cn.V, Nt, hiFace);
+    const Nn = cls === CLS.TIRE ? Nt : filteredNormals(cn.V, Nt, hiFace, list, cls === CLS.GLASS);
     const a = list.map((p) => faceAreas(p.V, p.F, false).reduce((s, v) => s + v, 0));
     const aw = a.map((v) => v + 1e-12), asum = aw.reduce((s, v) => s + v, 0);
     let color = [0, 1, 2].map((c) => list.reduce((s, p, i) => s + p.mat.color[c] * aw[i], 0) / asum);
     const rough = list.reduce((s, p, i) => s + (p.mat.roughness ?? 0.5) * aw[i], 0) / asum;
     if (cls === CLS.PAINT && paintLin && main) color = paintLin;
+    // windows sit a hair proud of the frame: body flanges and seals just behind the glass edge
+    // would otherwise poke through it after simplification (z-fighting shards)
+    if (cls === CLS.GLASS && cfg._isCar) for (let i = 0; i < cn.V.length; i++) cn.V[i] += Nn[i] * GLASS_LIFT * radius;
     allV.push(cn.V); allN.push(Nn);
     const Fo = new Uint32Array(cn.F.length);
     for (let k = 0; k < cn.F.length; k++) Fo[k] = cn.F[k] + vo;

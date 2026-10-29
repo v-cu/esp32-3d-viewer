@@ -68,6 +68,7 @@ CLS_MATCAP = {CLS_PAINT: 128, CLS_GLASS: 128, CLS_CHROME: 128}
 
 # classes whose texture brightness detail is kept per vertex
 WHEEL_RX = re.compile(r"wheel|(?<![a-z])rims?(?![a-z])|tyre|tire|felg")
+BODYCOL_RX = re.compile(r"(?<![a-z])colou?red(?![a-z])|body.?colou?r")
 LIVERY_RX = re.compile(r"paint|(?<![a-z])lack|primary")          # a textured paint material = livery
 TEX_DETAIL_CLS = (CLS_GENERIC, CLS_PLASTIC, CLS_INTERIOR, CLS_PAINT, CLS_LIGHT_RED, CLS_LIGHT_CLEAR)
 
@@ -312,7 +313,12 @@ def drop_lamp_covers(parts, dist=0.05):
         keep = ~((np.abs(cen[:, 0]) > 0.5) & (cen[:, 1] < 0.6 * car_h))
         if tree is not None:
             d, _ = tree.query(cen)
-            keep &= d > dist
+            near = d <= dist
+            # glass next to a lamp is its lens - except a window passing a lamp at window
+            # height (third brake light at the rear window): only a glass part that is mostly
+            # lamp lens loses its faces up there
+            lens = near.sum() > 0.5 * len(near)
+            keep &= ~(near & ((cen[:, 1] < 0.6 * car_h) | lens))
         dropped += int((~keep).sum())
         if keep.all():
             out.append(p)
@@ -568,14 +574,18 @@ def apply_texture_split(parts, is_car, max_colors):
     for p in parts:
         fcol = p.get("fcol")
         mode = None
-        if fcol is not None:
+        if fcol is not None and is_car and BODYCOL_RX.search((p["mat"]["name"] + " " + p["name"]).lower()):
+            pass                              # body-colour tint mask: painted later, never split
+        elif fcol is not None:
             if not is_car:
                 mode = "object"
             elif p["cls"] in (CLS_LIGHT_RED, CLS_LIGHT_CLEAR):
                 mode = "light"
-            elif p["cls"] == CLS_PAINT and (p.get("paint_by_name") or p is biggest_paint):   # livery
-                mode = "paint" if _is_atlas(fcol, len(p["F"]), 300) else None
-            elif p["cls"] == CLS_METAL and WHEEL_RX.search((p["mat"]["name"] + " " + p["name"]).lower()):
+            elif p["cls"] == CLS_PAINT and (p.get("paint_by_name") or
+                                             (biggest_paint is not None and p["mat"]["name"] == biggest_paint["mat"]["name"])):
+                mode = "paint" if _is_atlas(fcol, len(p["F"]), 300) else None      # livery
+            elif ((p["cls"] == CLS_METAL and WHEEL_RX.search((p["mat"]["name"] + " " + p["name"]).lower()))
+                  or (p.get("wheel_geom") and p["cls"] in (CLS_METAL, CLS_GENERIC, CLS_PLASTIC))):
                 mode = "wheel" if _is_atlas(fcol, len(p["F"]), 300) else None   # rim + tyre texture
             elif p["cls"] in (CLS_GENERIC, CLS_PLASTIC, CLS_PAINT, CLS_INTERIOR):
                 mode = "atlas" if _is_atlas(fcol, len(p["F"])) else None
@@ -647,6 +657,22 @@ def apply_texture_split(parts, is_car, max_colors):
                     out[-1]["paint_key"] = "main" if r == main_region else f"l{r}"
                 summary.append(f"{CLS_NAMES[cls]}:{int(m.sum())}")
         log(f"  '{p['name'][:40]}' ({mode}): {len(colors)} colour regions -> {' '.join(summary)}")
+    # livery over several parts of one material: the body colour is the colour with the
+    # largest area over all of them
+    by_src = {}
+    for q in out:
+        if q.get("paint_src"):
+            by_src.setdefault(q["paint_src"], []).append(q)
+    ck = lambda q: tuple(int(round(v * 6)) for v in linear_to_srgb(q["mat"]["color"]))
+    for lst in by_src.values():
+        area = {}
+        for q in lst:
+            Vq, Fq = q["V"], q["F"]
+            a = float(np.linalg.norm(np.cross(Vq[Fq[:, 1]] - Vq[Fq[:, 0]], Vq[Fq[:, 2]] - Vq[Fq[:, 0]]), axis=1).sum())
+            area[ck(q)] = area.get(ck(q), 0.0) + a
+        best = max(area, key=area.get)
+        for q in lst:
+            q["paint_key"] = "main" if ck(q) == best else "l" + ",".join(map(str, ck(q)))
     return out
 
 
@@ -655,11 +681,11 @@ def apply_texture_split(parts, is_car, max_colors):
 # --------------------------------------------------------------------------------------
 RULES = [
     # wheel hardware first: "Tire_Hub", "Tire_Disk", "Tire_Brake" are metal, not rubber
-    (CLS_METAL, r"hub|disk|disc|caliper|felge|(?<![a-z])rims?(?![a-z])|brake(?!.*(light|lamp|led|lens))"),
+    (CLS_METAL, r"hub|disk|disc|caliper|felge|(?<![a-z])rims?(?![a-z])|brake(?!.*(light|lamp|(?<![a-z])leds?(?![a-z])|lens))"),
     (CLS_INTERIOR, r"interior|leather|seat|carpet|dashboard|dash|steering|cockpit|fabric|alcantara|inner|innen"),
-    (CLS_LIGHT_RED, r"(tail|brake|stop).*(light|lamp|led|lens)|(rear|back).*(light|lamp|led)|(light|lamp|led|lens)[ _-]?red|red[ _-]?(light|lamp|led|lens)|rueckleucht|tylne|taillight"),
-    (CLS_LIGHT_CLEAR, r"head.?light|headlamp|projector|front.?light|lamp|lens|light|led|indicator|turn.?signal|reflector|scheinwerfer|reflektor"),
-    (CLS_GLASS, r"glass|window|windshield|windscreen|scheibe|szyb|glas"),
+    (CLS_LIGHT_RED, r"(tail|brake|stop).*(light|lamp|(?<![a-z])leds?(?![a-z])|lens)|(rear|back).*(light|lamp|(?<![a-z])leds?(?![a-z]))|(light|lamp|(?<![a-z])leds?(?![a-z])|lens)[ _-]?red|red[ _-]?(light|lamp|(?<![a-z])leds?(?![a-z])|lens)|rueckleucht|tylne|taillight"),
+    (CLS_LIGHT_CLEAR, r"head.?light|headlamp|projector|front.?light|lamp|lens|light|(?<![a-z])leds?(?![a-z])|indicator|turn.?signal|reflector|scheinwerfer|reflektor"),
+    (CLS_GLASS, r"glass|window|windshield|windscreen|scheibe|szyb|glas|cristal|crystal|vidrio|verre|vitre|vetro|szkl"),
     (CLS_CHROME, r"chrome|chrom|mirror_refl|polished"),
     (CLS_TIRE, r"tire|tyre|rubber|reifen|opon|guma|llanta"),
     (CLS_CARBON, r"carbon"),
@@ -676,7 +702,7 @@ def classify(part):
     # even when the material is a shared "lights and glass" one
     mn = part["mat"]["name"].lower()
     own = " ".join(part["name"].lower().split(mn)) if len(mn) >= 3 else part["name"].lower()
-    if re.search(r"window|windshield|windscreen|glass|scheibe|szyb", own) and not re.search(r"light|lamp|led|lens|mirror", own):
+    if re.search(r"window|windshield|windscreen|glass|scheibe|szyb", own) and not re.search(r"light|lamp|(?<![a-z])leds?(?![a-z])|lens|mirror", own):
         return CLS_GLASS
     for cls, rx in RULES:
         if re.search(rx, name):
@@ -1126,9 +1152,10 @@ def render_matcap(cls, color, size, rough_hint=0.5, unlit=False, obj=False):
 
 
 def _quantize565(srgb, size):
-    """ordered dither while quantising to RGB565"""
+    """quantise to RGB565 (no dither: the renderer samples nearest-neighbour, a dither pattern
+    shows as patches on large smooth panels)"""
     bayer = np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]) / 16.0 - 0.5
-    dith = np.tile(bayer, (size // 4 + 1, size // 4 + 1))[:size, :size]
+    dith = np.tile(bayer, (size // 4 + 1, size // 4 + 1))[:size, :size] * 0.0
     r = np.clip(np.floor(srgb[..., 0] * 31 + 0.5 + dith * 0.9), 0, 31).astype(np.uint16)
     g = np.clip(np.floor(srgb[..., 1] * 63 + 0.5 + dith * 0.9), 0, 63).astype(np.uint16)
     b = np.clip(np.floor(srgb[..., 2] * 31 + 0.5 + dith * 0.9), 0, 31).astype(np.uint16)
@@ -1149,6 +1176,13 @@ def lamp_front_sign(parts, R, x0=0.0):
     Uses the real lamp colours (texture or material) of light/glass parts: strongly red
     surfaces are tail lights, bright neutral surfaces are headlights."""
     xs_red, w_red, xs_wht, w_wht = [], [], [], []
+    total_area = 0.0
+    for p in parts:
+        if p["cls"] == CLS_DROP:
+            continue
+        Vt = p["mesh"].vertices @ R.T
+        Ft = np.asarray(p["mesh"].faces)
+        total_area += float(np.linalg.norm(np.cross(Vt[Ft[:, 1]] - Vt[Ft[:, 0]], Vt[Ft[:, 2]] - Vt[Ft[:, 0]]), axis=1).sum())
     for p in parts:
         if p["cls"] == CLS_DROP:
             continue
@@ -1182,8 +1216,11 @@ def lamp_front_sign(parts, R, x0=0.0):
         return None
     xr, wr = np.concatenate(xs_red), np.concatenate(w_red)
     xw, ww = np.concatenate(xs_wht), np.concatenate(w_wht)
-    if wr.sum() <= 0:
+    # a few stray red triangles are no evidence (relative to the whole model surface)
+    if wr.sum() <= 3e-4 * total_area:
         return None
+    if ww.sum() <= 3e-4 * total_area:
+        ww = np.zeros(0); xw = np.zeros(0)
     mr = np.average(xr, weights=wr)
     if ww.sum() <= 0:                   # only tail lights known: front is the other end
         span = max(float(np.abs(xr).max()), 1e-9)
@@ -1214,7 +1251,15 @@ def normalise_orientation(parts, cfg):
             continue
         Pv = p["mesh"].vertices @ R.T
         a, b = Pv.min(0), Pv.max(0)
+        e = b - a
+        flat = e.min() <= 0.02 * e.max()
+        nm = (p["name"] + " " + p["mat"]["name"]).lower()
         if b[1] - a[1] <= 0.02 * H and b[1] <= mn[1] + 0.03 * H and (b[0] - a[0]) * (b[2] - a[2]) >= 0.25 * A:
+            ground.append(p)
+        # shadow planes (any orientation) and big flat card / backdrop quads
+        elif flat and re.search(r"shadow|sombra|schatten", nm):
+            ground.append(p)
+        elif flat and len(p["mesh"].faces) <= 12 and e.max() > 0.5 * (mx - mn).max():
             ground.append(p)
     live = [p for p in parts if p["cls"] != CLS_DROP and all(p is not g for g in ground)]
     if ground and live:
@@ -1223,7 +1268,7 @@ def normalise_orientation(parts, cfg):
         if e2[1] >= 0.05 * max(e2[0], e2[2]):
             for g in ground:
                 g["cls"] = CLS_DROP
-            log("  removed ground plane: " + ", ".join(g["name"] for g in ground))
+            log("  removed ground / shadow planes: " + ", ".join(g["name"] for g in ground))
     live = [p for p in parts if p["cls"] != CLS_DROP]
     allV = np.concatenate([p["mesh"].vertices for p in live])
     V = allV @ R.T
@@ -1250,6 +1295,7 @@ def normalise_orientation(parts, cfg):
                 continue
             wheels += 1
             ends.add(c > 0)
+            p["wheel_geom"] = True
         if len(ends) < 2:
             wheels = 0
     is_car = cfg.get("kind", "auto") == "car" or (
@@ -1257,11 +1303,9 @@ def normalise_orientation(parts, cfg):
         (any(p["cls"] in (CLS_TIRE, CLS_LIGHT_RED, CLS_LIGHT_CLEAR) for p in live) or
          (car_shape and (wheels >= 3 or any(p["cls"] == CLS_PAINT for p in live)))))
     cfg["_is_car"] = is_car
-    if not is_car:
-        # generic object (figure, toy, ...): glTF convention, front faces +Z -> viewer front +X
+    # glTF convention: the front faces +Z -> becomes +X (lamps or part names may turn it later)
+    if not is_car or ext[2] > ext[0]:
         R = rot_y(90) @ R
-    elif ext[2] > ext[0]:                  # car: length along Z -> rotate to X
-        R = rot_y(-90) @ R
     V = allV @ R.T
     # front detection: headlights (light_clear) vs taillights (light_red)
     if "yaw_deg" in cfg:
@@ -1274,6 +1318,22 @@ def normalise_orientation(parts, cfg):
             fr, rr = cx(CLS_LIGHT_CLEAR), cx(CLS_LIGHT_RED)
             if fr and rr:
                 side = 1 if np.concatenate(fr)[:, 0].mean() > np.concatenate(rr)[:, 0].mean() else -1
+        if side is None:                   # part names: "front", "rear", wheel_FL / WheelBR ...
+            FRONT = re.compile(r"front|frnt|(?<![a-z])f[lr](?![a-z])|wheel_?f[lr]|f[lr]_?wheel")
+            REAR = re.compile(r"rear|back|(?<![a-z])[rb][lr](?![a-z])|wheel_?[rb][lr]|[rb][lr]_?wheel")
+            xf, xr2 = [], []
+            for p in parts:
+                if p["cls"] == CLS_DROP:
+                    continue
+                nm = p["name"].lower()
+                isf, isr = bool(FRONT.search(nm)), bool(REAR.search(nm))
+                if isf == isr:
+                    continue
+                sx = float((p["mesh"].vertices @ R.T)[:, 0].mean())
+                (xf if isf else xr2).append(sx)
+            if xf and xr2 and abs(np.mean(xf) - np.mean(xr2)) > 1e-6:
+                side = 1 if np.mean(xf) > np.mean(xr2) else -1
+                log("  front: from part names (front / rear)")
         if side is not None and side < 0:
             R = rot_y(180) @ R
     if cfg.get("flip_front", False):
@@ -1291,6 +1351,58 @@ def normalise_orientation(parts, cfg):
 # --------------------------------------------------------------------------------------
 # Main pipeline
 # --------------------------------------------------------------------------------------
+NORMAL_FILTER_R = 0.03
+GLASS_LIFT = 0.004
+
+
+def filtered_normals(Vn, Nn, hf, ok, sheet=False):
+    """Normal of a smooth surface patch around each vertex: area weighted normals of the
+    visible source faces of the same material group within NORMAL_FILTER_R that face the same
+    way (< 50 deg). Panel gaps, rivets and other detail the simplified mesh can not show no
+    longer bend the vertex normals, so doors and bonnets reflect evenly. Thin sheets (glass)
+    take faces of either orientation."""
+    cos_t = math.cos(math.radians(50))
+    out = Nn.copy()
+    lists = hf["tree"].query_ball_point(Vn, NORMAL_FILTER_R)
+    for i, idx in enumerate(lists):
+        if len(idx) < 8:
+            continue
+        idx = np.asarray(idx)
+        idx = idx[ok[idx]]
+        if len(idx) < 8:
+            continue
+        fn = hf["N"][idx]
+        d = fn @ Nn[i]
+        if sheet:
+            fn = np.where((d < 0)[:, None], -fn, fn); d = np.abs(d)
+        m = d >= cos_t
+        if m.sum() < 8:
+            continue
+        a = (fn[m] * hf["A"][idx[m], None]).sum(0)
+        ln = np.linalg.norm(a)
+        if ln > 1e-12:
+            out[i] = a / ln
+    return out
+
+
+def turn_flipped(Vg, Fg, hf, ok, hi_flip):
+    """Faces lying over source patches that are seen from behind get turned around."""
+    Fg = Fg.copy()
+    cen = Vg[Fg].mean(1)
+    d, q = hf["tree"].query(cen, k=16, distance_upper_bound=NORMAL_FILTER_R)
+    n = len(hf["C"])
+    for f in range(len(Fg)):
+        for j in range(16):
+            k = q[f, j]
+            if k >= n:
+                break
+            if ok[k]:
+                if hi_flip[k]:
+                    Fg[f] = Fg[f, [0, 2, 1]]
+                break
+    return Fg
+
+
 def parse_color(s):
     s = s.strip().lstrip("#")
     return srgb_to_linear(np.array([int(s[i:i + 2], 16) / 255.0 for i in (0, 2, 4)]))
@@ -1380,6 +1492,7 @@ def convert(args):
     hiV = V
 
     # ---- hidden surface removal
+    hi_flip = np.zeros(len(F), bool)
     if not args.keep_hidden:
         vis, fcnt, bcnt = visible_triangles(V, F, radius, n_views=args.views)
         # orientation vote per connected patch: flip whole patches seen mostly from behind
@@ -1394,6 +1507,24 @@ def convert(args):
             if (bcnt[comp] - fcnt[comp]).sum() > 0:
                 flip[comp] = True
         F[flip] = F[flip][:, [0, 2, 1]]
+        # inside a piece whose winding could not be made consistent (a mirrored panel welded to
+        # its neighbour), a larger patch seen clearly from behind is wound the wrong way: the
+        # device would cull it and show what lies behind. Turned only in the final mesh
+        # (hi_flip) - turning it here leaves edges the simplifier treats as borders.
+        fr_ = np.where(flip, bcnt, fcnt); bk_ = np.where(flip, fcnt, bcnt)
+        cand = (bk_ >= 4) & (bk_ > 6 * fr_)
+        if cand.any():
+            adj = tm.face_adjacency
+            adj = adj[cand[adj[:, 0]] & cand[adj[:, 1]]]
+            ci = np.nonzero(cand)[0]
+            try:
+                cl = trimesh.graph.connected_components(adj, nodes=ci, min_len=16)
+            except Exception:
+                cl = []
+            for c in cl:
+                hi_flip[np.asarray(c)] = True
+            if hi_flip.any():
+                log(f"  {int(hi_flip.sum())} triangles seen from behind: turned in the final mesh")
         twosided = vis & (np.minimum(fcnt, bcnt) >= 0.3 * np.maximum(fcnt, bcnt)) & (np.maximum(fcnt, bcnt) >= 3)
         for i, p in enumerate(parts):
             m = owner == i
@@ -1406,6 +1537,13 @@ def convert(args):
 
     # high-resolution smooth vertex normals (area weighted) - transferred to the final mesh
     fnr = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    fnr[hi_flip] *= -1
+    # high resolution faces (centroid / unit normal / area / part / visible) for the
+    # filtered normals and the final winding fix
+    fl = np.maximum(np.linalg.norm(fnr, axis=1), 1e-20)
+    hi_face = dict(C=V[F].mean(1), N=fnr / fl[:, None], A=fl, own=owner.copy(), vis=vis.copy(),
+                   start=[p["hi_range"][0] for p in parts])
+    hi_face["tree"] = cKDTree(hi_face["C"])
     hiN = np.zeros_like(V)
     for k in range(3):
         np.add.at(hiN, F[:, k], fnr)
@@ -1445,6 +1583,30 @@ def convert(args):
                     p["cls"] = CLS_PLASTIC if lum < 0.02 else CLS_GENERIC
                     p["paint_key"] = None
             log(f"  paint: material '{mname}'" + (" (with livery)" if any(p.get("paint_src") == mname for p in parts) else ""))
+            # "Coloured" / "body colour" materials are tinted with the paint colour at run time
+            # (game asset convention); their own base colour is a neutral grey
+            ref, ra = None, 0.0
+            for i, p in enumerate(parts):
+                if p["cls"] == CLS_PAINT and (p.get("paint_src") or p["mat"]["name"]) == mname and \
+                        p.get("paint_key") in (None, "main"):
+                    a = areas[(owner == i) & vis].sum()
+                    if a > ra:
+                        ra, ref = a, p
+            nbc = 0
+            if ref is not None:
+                for p in parts:
+                    if p.get("from_split") or p is ref or p["cls"] not in (CLS_METAL, CLS_GENERIC, CLS_PLASTIC, CLS_PAINT):
+                        continue
+                    if not BODYCOL_RX.search((p["mat"]["name"] + " " + p["name"]).lower()):
+                        continue
+                    p["cls"] = CLS_PAINT; p["paint_key"] = "main"
+                    p["mat"] = dict(p["mat"]); p["mat"]["color"] = np.array(ref["mat"]["color"], dtype=np.float64)
+                    p["tex_detail"] = False             # its texture is the tint mask, not shading
+                    o0, n0 = p["hi_range"]
+                    hiCol[o0:o0 + n0] = -1
+                    nbc += 1
+            if nbc:
+                log(f"  body-colour parts painted: {nbc}")
 
     tot_area = np.array([areas[owner == i].sum() for i in range(len(parts))])
     vis_area0 = np.array([areas[(owner == i) & vis].sum() for i in range(len(parts))])
@@ -1600,6 +1762,10 @@ def convert(args):
         Vg = np.concatenate([p["V"] for p in plist])
         Fg = np.concatenate([p["F"] + o for p, o in zip(plist, np.cumsum([0] + [len(q["V"]) for q in plist])[:-1])])
         crease = args.crease if cls != CLS_TIRE else 60
+        starts = {p["hi_range"][0] for p in plist if p.get("hi_range")}
+        ok = np.array([st in starts for st in hi_face["start"]])[hi_face["own"]] & hi_face["vis"]
+        if hi_flip.any() and cls != CLS_GLASS and not any(p.get("twosided") for p in plist):
+            Fg = turn_flipped(Vg, Fg, hi_face, ok, hi_flip)
         Vn, Nn, Fn = crease_normals(Vg, Fg, crease)
         Nn, _ = transfer_normals(Vn, Nn, hi_tree, hiN)
         if cls == CLS_GLASS:
@@ -1607,6 +1773,12 @@ def convert(args):
             # into the car (dark AO, wrong reflection). Glass is outside: point them outwards.
             rel = Vn - np.array([0.0, y_mid, 0.0])
             Nn = np.where((np.sum(rel * Nn, axis=1) < 0)[:, None], -Nn, Nn)
+        if cls != CLS_TIRE:
+            Nn = filtered_normals(Vn, Nn, hi_face, ok, sheet=cls == CLS_GLASS)
+        if cls == CLS_GLASS and cfg.get("_is_car"):
+            # windows sit a hair proud of the frame: flanges and seals just behind the glass
+            # edge would otherwise poke through after simplification
+            Vn = Vn + Nn * GLASS_LIFT * radius
         if args.reflection_lod > 0 and meshopt is not None and len(Fg) > 8:
             F1g = meshopt_simplify(Vg, Fg, max(4, int(len(Fg) * args.reflection_lod)))
             u1 = np.unique(F1g)

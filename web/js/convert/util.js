@@ -396,6 +396,26 @@ export function faceComponents(F, nv) {
   return { labels: lab, count: uf.count };
 }
 
+// connected patches whose winding agrees across every shared edge (a->b in one face, b->a in
+// the other); a component with inconsistent winding falls apart into several patches
+export function orientedPatches(F, nv) {
+  const nf = F.length / 3;
+  const uf = new UnionFind(nf);
+  const { start, items } = vertexFaces(F, nv);
+  for (let f = 0; f < nf; f++) {
+    for (let k = 0; k < 3; k++) {
+      const a = F[3 * f + k], b = F[3 * f + (k + 1) % 3];
+      for (let s = start[a]; s < start[a + 1]; s++) {
+        const g = items[s];
+        if (g <= f) continue;
+        for (let j = 0; j < 3; j++)
+          if (F[3 * g + j] === b && F[3 * g + (j + 1) % 3] === a) { uf.union(f, g); break; }
+      }
+    }
+  }
+  return { labels: uf.labels(), count: uf.count };
+}
+
 export function concatF64(list) {
   let n = 0;
   for (const a of list) n += a.length;

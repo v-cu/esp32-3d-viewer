@@ -147,6 +147,9 @@ function tonemap1(c) {
 }
 
 const BAYER = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5].map((v) => v / 16 - 0.5);
+// no dithering: the renderer samples the matcap nearest-neighbour, so on a large smooth panel
+// (bonnet, windscreen) a few texels cover a big area and a dither pattern shows as patches
+const MATCAP_DITHER = 0;
 
 // returns { rgb565: Uint16Array(size*size), srgb: Float32Array(size*size*3) }
 export function renderMatcap(cls, color, size, roughHint = 0.5, opts = {}) {
@@ -165,7 +168,7 @@ export function renderMatcap(cls, color, size, roughHint = 0.5, opts = {}) {
     for (let j = 0; j < size; j++)
       for (let i = 0; i < size; i++) {
         const k = (2 * j) * S + 2 * i, sh = 0.86 + 0.14 * G.ndv[k];
-        const dith = BAYER[(j & 3) * 4 + (i & 3)] * 0.9;
+        const dith = BAYER[(j & 3) * 4 + (i & 3)] * MATCAP_DITHER;
         const px = c.map((v) => linToSrgb1(v * sh));
         srgb.set(px, 3 * (j * size + i));
         const r = Math.min(Math.max(Math.floor(px[0] * 31 + 0.5 + dith), 0), 31);
@@ -282,7 +285,7 @@ export function renderMatcap(cls, color, size, roughHint = 0.5, opts = {}) {
   const rgb565 = new Uint16Array(size * size), srgb = new Float32Array(size * size * 3);
   for (let j = 0; j < size; j++)
     for (let i = 0; i < size; i++) {
-      const dith = BAYER[(j & 3) * 4 + (i & 3)] * 0.9;
+      const dith = BAYER[(j & 3) * 4 + (i & 3)] * MATCAP_DITHER;
       const px = [0, 0, 0];
       for (let ch = 0; ch < 3; ch++) {
         const a = out[3 * ((2 * j) * S + 2 * i) + ch], b = out[3 * ((2 * j) * S + 2 * i + 1) + ch];
