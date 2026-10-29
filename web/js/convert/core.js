@@ -1081,6 +1081,9 @@ export async function convert(inputParts, opts = {}, hooks = {}) {
   for (const p of parts) delete p.V0;
   parts = parts.filter((p) => p.cls !== CLS_DROP);
   log(`  mode: ${cfg._isCar ? 'car' : 'object'}`);
+  // "interior" (seats, dashboard: dim, hidden inside a car) means nothing for an object - a
+  // sofa's "fabric" is its visible surface
+  if (!cfg._isCar) for (const p of parts) if (p.cls === CLS.INTERIOR) p.cls = CLS.GENERIC;
   parts = dropOverlayShells(parts, log);
   if (cfg._isCar) parts = lampsByPosition(parts, log);
   parts = applyTextureSplit(parts, cfg._isCar, texColors, log);

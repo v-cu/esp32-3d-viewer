@@ -1443,6 +1443,10 @@ def convert(args):
     normalise_orientation(parts, cfg)
     parts = [p for p in parts if p["cls"] != CLS_DROP]
     log(f"  mode: {'car' if cfg['_is_car'] else 'object'}")
+    if not cfg["_is_car"]:               # "interior" (dim, inside a car) means nothing for an object
+        for p in parts:
+            if p["cls"] == CLS_INTERIOR:
+                p["cls"] = CLS_GENERIC
     parts = drop_overlay_shells(parts)
     if cfg["_is_car"]:
         for p in parts:

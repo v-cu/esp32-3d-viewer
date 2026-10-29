@@ -6,6 +6,7 @@ import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 import { MTLLoader } from 'three/addons/loaders/MTLLoader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 
 const MODEL_EXT = ['glb', 'gltf', 'obj'];
 const ext = (n) => (n.split('.').pop() || '').toLowerCase();
@@ -19,6 +20,17 @@ const l2s = (c) => { c = Math.min(Math.max(c, 0), 1); return c <= 0.0031308 ? c 
 // texture image -> {data, w, h} (max 1024 px, enough for colour regions)
 const imageCache = new WeakMap();
 function texturePixels(tex) {
+  // KTX2 (Basis) textures are transcoded to plain RGBA (see getKTX2): read the mip level
+  // closest to 1024 px straight from the data
+  if (tex && tex.isCompressedTexture && tex.mipmaps && tex.mipmaps.length && tex.format === THREE.RGBAFormat) {
+    if (imageCache.has(tex)) return imageCache.get(tex);
+    let m = tex.mipmaps[0];
+    for (const q of tex.mipmaps) if (Math.max(q.width, q.height) >= 256 && Math.max(q.width, q.height) <= 1024) { m = q; break; }
+    const ok = m && m.data && m.data.length >= m.width * m.height * 4;
+    const out = ok ? { data: m.data, w: m.width, h: m.height } : null;
+    imageCache.set(tex, out);
+    return out;
+  }
   const img = tex && tex.image;
   if (!img || !(img.width > 0)) return null;
   if (imageCache.has(img)) return imageCache.get(img);
@@ -82,8 +94,15 @@ function extractParts(root, hasMtl) {
     if (geo.drawRange && geo.drawRange.count !== Infinity && geo.drawRange.count < 3) return;
     const nv = pos.count;
     const V = new Float32Array(nv * 3);
+    // skinned characters: the pose the skeleton holds in the file (as a viewer shows it),
+    // not the raw bind-pose vertices; active morph targets are applied as well
+    const posed = (obj.isSkinnedMesh && obj.skeleton) ||
+      (geo.morphAttributes && geo.morphAttributes.position && obj.morphTargetInfluences &&
+       obj.morphTargetInfluences.some((x) => x));
+    if (obj.isSkinnedMesh && obj.skeleton) obj.skeleton.update();
     for (let i = 0; i < nv; i++) {
-      v.fromBufferAttribute(pos, i).applyMatrix4(obj.matrixWorld);
+      if (posed) obj.getVertexPosition(i, v); else v.fromBufferAttribute(pos, i);
+      v.applyMatrix4(obj.matrixWorld);
       V[3 * i] = v.x; V[3 * i + 1] = v.y; V[3 * i + 2] = v.z;
     }
     let I;
@@ -181,6 +200,21 @@ function getDraco() {
   return dracoLoader;
 }
 
+// KTX2 / Basis textures (KHR_texture_basisu). No GPU here: every compressed target is
+// reported as unsupported, so the transcoder produces plain RGBA pixels the converter reads.
+let ktx2Loader = null;
+function getKTX2() {
+  if (!ktx2Loader) {
+    ktx2Loader = new KTX2Loader();
+    ktx2Loader.setTranscoderPath(new URL('../vendor/three/addons/libs/basis/', import.meta.url).href);
+    ktx2Loader.workerConfig = {
+      astcSupported: false, astcHDRSupported: false, etc1Supported: false, etc2Supported: false,
+      dxtSupported: false, bptcSupported: false, pvrtcSupported: false,
+    };
+  }
+  return ktx2Loader;
+}
+
 /*
  * files: File[] dropped together. Picks the first .glb/.gltf/.obj as the model; the other
  * files (.bin, .mtl, textures) are found by file name.
@@ -213,6 +247,7 @@ export async function loadModel(files) {
       const loader = new GLTFLoader(manager);
       loader.setDRACOLoader(getDraco());
       loader.setMeshoptDecoder(MeshoptDecoder);
+      loader.setKTX2Loader(getKTX2());
       const gltf = await loader.loadAsync(mainUrl);
       root = gltf.scene || (gltf.scenes && gltf.scenes[0]);
     } else {
